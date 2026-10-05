@@ -79,39 +79,28 @@ const appAssetsPlugin: BunPlugin = {
     }))
   },
 }
-const pluginRuntimeEntries = discoverPluginRuntimeSpecifiers(path.join(dir, "src"))
-const pluginRuntimeSpecifierSet = new Set(pluginRuntimeEntries.map(([specifier]) => specifier))
+const pluginRuntimeSpecifiers = discoverPluginRuntimeSpecifiers()
 const pluginRuntimeLoaderCode = (specifier: string) => {
   if (specifier.startsWith("effect/")) {
     const subpath = specifier.slice("effect/".length)
     const slash = subpath.lastIndexOf("/")
     const parent = slash === -1 ? "effect" : `effect/${subpath.slice(0, slash)}`
     const member = slash === -1 ? subpath : subpath.slice(slash + 1)
-    if (
-      pluginRuntimeSpecifierSet.has(parent) &&
-      /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(member) &&
-      member in require(Bun.resolveSync(parent, path.join(dir, "src")))
-    ) {
+    const parentPath = pluginRuntimeSpecifiers.get(parent)
+    if (parentPath && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(member) && member in require(parentPath)) {
       return `() => require(${JSON.stringify(parent)}).${member}`
     }
   }
   return `() => require(${JSON.stringify(specifier)})`
 }
 const pluginRuntimeSource = `const runtimeModulesKey = Symbol.for("opencode.plugin.runtime-modules")
-const runtimeInstalledKey = Symbol.for("opencode.plugin.runtime-installed")
 const modules = {
-${pluginRuntimeEntries.map(([specifier]) => `  ${JSON.stringify(specifier)}: ${pluginRuntimeLoaderCode(specifier)},`).join("\n")}
-}
-export function pluginRuntimeModules() {
-  const state = globalThis
-  state[runtimeModulesKey] = modules
-  return modules
+${[...pluginRuntimeSpecifiers.keys()].map((specifier) => `  ${JSON.stringify(specifier)}: ${pluginRuntimeLoaderCode(specifier)},`).join("\n")}
 }
 export function ensurePluginRuntime() {
   const state = globalThis
+  if (state[runtimeModulesKey]) return state[runtimeModulesKey]
   state[runtimeModulesKey] = modules
-  if (state[runtimeInstalledKey]) return modules
-  state[runtimeInstalledKey] = true
   Bun.plugin({
     name: "opencode-plugin-runtime",
     setup(build) {
@@ -133,8 +122,6 @@ export function ensurePluginRuntime() {
   return modules
 }
 `
-const scalarSwaggerStub =
-  'export const css = ""; export const javascript = \'document.body.textContent = "Scalar/Swagger UI assets are not bundled in OpenCode"\''
 const pluginRuntimePlugin: BunPlugin = {
   name: "opencode-plugin-runtime",
   setup(build) {
@@ -143,7 +130,8 @@ const pluginRuntimePlugin: BunPlugin = {
       loader: "js",
     }))
     build.onLoad({ filter: /[/\\]internal[/\\]httpApi(?:Scalar|Swagger)\.js$/ }, () => ({
-      contents: scalarSwaggerStub,
+      contents:
+        'export const css = ""; export const javascript = \'document.body.textContent = "Scalar/Swagger UI assets are not bundled in OpenCode"\'',
       loader: "js",
     }))
   },

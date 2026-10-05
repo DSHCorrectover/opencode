@@ -2,37 +2,50 @@ import { existsSync, realpathSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 
-export type RuntimeModuleLoader = () => Record<string, unknown> | Promise<Record<string, unknown>>
+type RuntimeModuleLoader = () => Record<string, unknown> | Promise<Record<string, unknown>>
 
 const runtimeModulesKey = Symbol.for("opencode.plugin.runtime-modules")
-const runtimeInstalledKey = Symbol.for("opencode.plugin.runtime-installed")
 
 type GlobalState = typeof globalThis & {
   [runtimeModulesKey]?: Readonly<Record<string, RuntimeModuleLoader>>
-  [runtimeInstalledKey]?: boolean
 }
 
-export function discoverPluginRuntimeSpecifiers(from = import.meta.dir): ReadonlyArray<readonly [string, string]> {
-  return [...discoverPackageSpecifiers("effect", from), ...discoverPackageSpecifiers("@opencode/plugin", from)]
+export function discoverPluginRuntimeSpecifiers(): ReadonlyMap<string, string> {
+  const entries = new Map<string, string>()
+  for (const pkgName of ["effect", "@opencode/plugin"]) {
+    const dir = realpathSync(path.dirname(Bun.resolveSync(`${pkgName}/package.json`, import.meta.dir)))
+    const [subdir, ext] = existsSync(path.join(dir, "dist")) ? ["dist", ".js"] : ["src", ".ts"]
+    const scanDir = path.join(dir, subdir)
+    entries.set(pkgName, Bun.resolveSync(pkgName, import.meta.dir))
+    for (const file of new Bun.Glob(`**/*${ext}`).scanSync({ cwd: scanDir })) {
+      const normalized = file.replaceAll("\\", "/")
+      if (normalized.startsWith("internal/") || normalized.includes("/internal/") || normalized.startsWith("source.")) {
+        continue
+      }
+      const base = normalized.slice(0, -ext.length)
+      if (base === "index") continue
+      if (!base.endsWith("/index")) {
+        entries.set(`${pkgName}/${base}`, path.join(scanDir, file))
+        continue
+      }
+      for (const specifier of [`${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`]) {
+        try {
+          entries.set(specifier, Bun.resolveSync(specifier, import.meta.dir))
+        } catch {}
+      }
+    }
+  }
+  return entries
 }
 
-export function pluginRuntimeModules(): Readonly<Record<string, RuntimeModuleLoader>> {
+export function ensurePluginRuntime(): Readonly<Record<string, RuntimeModuleLoader>> {
   if (typeof Bun === "undefined") return {}
   const state = globalThis as GlobalState
   if (state[runtimeModulesKey]) return state[runtimeModulesKey]
   const modules = Object.fromEntries(
-    discoverPluginRuntimeSpecifiers().map(([specifier, resolved]) => [specifier, createLoader(resolved)]),
+    [...discoverPluginRuntimeSpecifiers().entries()].map(([specifier, resolved]) => [specifier, createLoader(resolved)]),
   )
   state[runtimeModulesKey] = modules
-  return modules
-}
-
-export function ensurePluginRuntime() {
-  if (typeof Bun === "undefined") return {}
-  const state = globalThis as GlobalState
-  const modules = pluginRuntimeModules()
-  if (state[runtimeInstalledKey]) return modules
-  state[runtimeInstalledKey] = true
   const foreignFilter = createForeignPackageFilter()
   Bun.plugin({
     name: "opencode-plugin-runtime",
@@ -70,44 +83,17 @@ function createLoader(resolved: string): RuntimeModuleLoader {
   }
 }
 
-function discoverPackageSpecifiers(pkgName: string, from: string): ReadonlyArray<readonly [string, string]> {
-  const pkgPath = Bun.resolveSync(`${pkgName}/package.json`, from)
-  const dir = realpathSync(path.dirname(pkgPath))
-  const [subdir, ext] = existsSync(path.join(dir, "dist")) ? ["dist", ".js"] : ["src", ".ts"]
-  const scanDir = path.join(dir, subdir)
-  const entries = new Map<string, string>([[pkgName, Bun.resolveSync(pkgName, from)]])
-  for (const file of new Bun.Glob(`**/*${ext}`).scanSync({ cwd: scanDir })) {
-    const normalized = file.replaceAll("\\", "/")
-    if (normalized.startsWith("internal/") || normalized.includes("/internal/") || normalized.startsWith("source.")) {
-      continue
-    }
-    const base = normalized.slice(0, -ext.length)
-    const candidates = base.endsWith("/index")
-      ? [`${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`]
-      : [`${pkgName}/${base}`]
-    for (const specifier of candidates) {
-      if (specifier === `${pkgName}/`) continue
-      try {
-        entries.set(specifier, Bun.resolveSync(specifier, from))
-      } catch {}
-    }
-  }
-  return [...entries.entries()].toSorted(([left], [right]) => left.localeCompare(right))
-}
-
 function createForeignPackageFilter() {
   const roots = new Set<string>()
   for (const pkgName of ["effect", "@opencode/plugin"]) {
-    try {
-      const dir = path.dirname(Bun.resolveSync(`${pkgName}/package.json`, import.meta.dir))
-      roots.add(dir)
-      roots.add(realpathSync(dir))
-    } catch {}
+    const dir = path.dirname(Bun.resolveSync(`${pkgName}/package.json`, import.meta.dir))
+    roots.add(dir)
+    roots.add(realpathSync(dir))
   }
-  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const suffix = String.raw`[/\\]node_modules[/\\](?:effect|@opencode[/\\]plugin)[/\\].*\.[cm]?[jt]sx?(?:[?#].*)?$`
-  if (roots.size === 0) return new RegExp(suffix)
-  return new RegExp(`^(?!(?:${[...roots].map(escape).join("|")})[/\\\\]).*${suffix}`)
+  const escaped = [...roots].map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
+  return new RegExp(
+    `^(?!(?:${escaped})[/\\\\]).*[/\\\\]node_modules[/\\\\](?:effect|@opencode[/\\\\]plugin)[/\\\\].*\\.[cm]?[jt]sx?(?:[?#].*)?$`,
+  )
 }
 
 function formatForeignPackageError(filePath: string) {
