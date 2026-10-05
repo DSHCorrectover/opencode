@@ -112,11 +112,14 @@ it.live("loads plugins and their transitive dependencies against the host's Effe
     const hostEffectDir = path.dirname(Bun.resolveSync("effect/package.json", import.meta.dir))
 
     yield* Effect.promise(async () => {
-      await mkdir(path.join(pluginDir, "node_modules"), { recursive: true })
-      await cp(hostEffectDir, pluginEffectDir, { recursive: true })
+      await mkdir(path.join(pluginEffectDir, "dist"), { recursive: true })
+      await cp(path.join(hostEffectDir, "dist"), path.join(pluginEffectDir, "dist"), {
+        recursive: true,
+        filter: (src) => !src.endsWith(".d.ts") && !src.endsWith(".map") && !/httpApi(?:Scalar|Swagger)\.js$/.test(src),
+      })
 
       const pkgPath = path.join(pluginEffectDir, "package.json")
-      const pkg = { ...(await Bun.file(pkgPath).json()), version: "4.0.0-rc.111" }
+      const pkg = { ...(await Bun.file(path.join(hostEffectDir, "package.json")).json()), version: "4.0.0-rc.111" }
       await writeFile(pkgPath, JSON.stringify(pkg, null, 2))
 
       // Sabotage the plugin's own Effect copy with the version-skew failure modes so loading it would crash:
