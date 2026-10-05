@@ -7,6 +7,7 @@ import "../src/plugin/runtime-plugin-support.bun"
 import { createPluginSources } from "../src/plugin/source"
 import { createSourceWatcher } from "../src/plugin/watch"
 import { createSignal } from "solid-js"
+import { Effect, Option, Schema } from "effect"
 import { Plugin } from "@opencode/plugin/tui"
 import { tmpdir } from "./fixture/fixture"
 
@@ -137,6 +138,141 @@ test("shared runtime and ordinary package identities survive plugin generations"
     expect(loaded).toMatchObject({ label })
   }
 })
+
+test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect resolve effect and effect/* to the host copy", async () => {
+  await using sources = await fixture()
+  const entry = new URL("tui.ts", sources.url)
+  await Bun.write(
+    new URL("node_modules/effect/package.json", sources.url),
+    '{"name":"effect","version":"4.0.0-rc.111","type":"module","exports":{".":"./index.js","./Option":"./Option.js","./RemovedSubpath":"./RemovedSubpath.js","./package.json":"./package.json"}}',
+  )
+  await Bun.write(
+    new URL("node_modules/effect/index.js", sources.url),
+    "export const Effect = { foreign: true }; export const Schema = { foreign: true }",
+  )
+  await Bun.write(new URL("node_modules/effect/Option.js", sources.url), "export const some = () => null")
+  await Bun.write(new URL("node_modules/effect/RemovedSubpath.js", sources.url), "export const removed = true")
+  await Bun.write(
+    new URL("node_modules/effect-helper/package.json", sources.url),
+    '{"name":"effect-helper","type":"module","exports":{".":"./index.js"}}',
+  )
+  await Bun.write(
+    new URL("node_modules/effect-helper/index.js", sources.url),
+    'import { Effect, Schema } from "effect"; import { some } from "effect/Option"; export const helper = { Effect, Schema, some }',
+  )
+  await Bun.write(
+    entry,
+    `import { createSignal } from "solid-js"
+    import { Plugin } from "@opencode/plugin/tui"
+    import { Effect, Schema } from "effect"
+    import { some } from "effect/Option"
+    import pkg from "effect/package.json" with { type: "json" }
+    import { helper } from "effect-helper"
+    export const plugin = { createSignal, Plugin, Effect, Schema, some, pkgName: pkg.name }
+    export { helper }`,
+  )
+  const loaded = (await sources.read(entry.href)).module as {
+    plugin: {
+      createSignal: unknown
+      Plugin: unknown
+      Effect: unknown
+      Schema: unknown
+      some: unknown
+      pkgName: string
+    }
+    helper: { Effect: unknown; Schema: unknown; some: unknown }
+  }
+  expect(loaded.plugin.createSignal).toBe(createSignal)
+  expect(loaded.plugin.Plugin).toBe(Plugin)
+  expect(loaded.plugin.Effect).toBe(Effect)
+  expect(loaded.plugin.Schema).toBe(Schema)
+  expect(loaded.plugin.some).toBe(Option.some)
+  expect(loaded.plugin.pkgName).toBe("effect")
+  expect(loaded.helper.Effect).toBe(Effect)
+  expect(loaded.helper.Schema).toBe(Schema)
+  expect(loaded.helper.some).toBe(Option.some)
+
+  const badEntry = new URL("bad-tui.ts", sources.url)
+  await Bun.write(
+    badEntry,
+    'import { Plugin } from "@opencode/plugin/tui"; import { removed } from "effect/RemovedSubpath"; export default { Plugin, removed }',
+  )
+  await expect(sources.read(badEntry.href)).rejects.toThrow("effect/RemovedSubpath.js")
+})
+
+test.each(["cli-first", "opentui-first"] as const)(
+  "resolves host Effect in TUI plugins across registration order: %s",
+  async (order) => {
+    await using dir = await tmpdir()
+    await Bun.write(
+      path.join(dir.path, "node_modules/effect/package.json"),
+      '{"name":"effect","type":"module","exports":{".":"./index.js","./Brand":"./Brand.js"}}',
+    )
+    await Bun.write(path.join(dir.path, "node_modules/effect/index.js"), "export const Effect = { foreign: true }")
+    await Bun.write(path.join(dir.path, "node_modules/effect/Brand.js"), "export const nominal = () => null")
+    const pluginEntry = path.join(dir.path, "tui.ts")
+    await Bun.write(
+      pluginEntry,
+      `import { Plugin } from "@opencode/plugin/tui"
+      import { createSignal } from "solid-js"
+      import { Effect } from "effect"
+      import { nominal } from "effect/Brand"
+      export const captured = { Plugin, createSignal, Effect, nominal }`,
+    )
+
+    const cliRuntimePath = fileURLToPath(new URL("../../cli/src/plugin-runtime.ts", import.meta.url))
+    const tuiSupportPath = fileURLToPath(new URL("../src/plugin/runtime-plugin-support.bun.ts", import.meta.url))
+    const tuiSourcePath = fileURLToPath(new URL("../src/plugin/source.ts", import.meta.url))
+    const solidPath = Bun.resolveSync("solid-js", import.meta.dir)
+
+    const probe = path.join(dir.path, "probe.ts")
+    const setupLines =
+      order === "cli-first"
+        ? `const { ensurePluginRuntime } = await import(${JSON.stringify(cliRuntimePath)})
+           ensurePluginRuntime()
+           await import(${JSON.stringify(tuiSupportPath)})`
+        : `await import(${JSON.stringify(tuiSupportPath)})`
+
+    await Bun.write(
+      probe,
+      `import assert from "node:assert/strict"
+      ${setupLines}
+      const { createPluginSources } = await import(${JSON.stringify(tuiSourcePath)})
+      const { Effect, Brand } = await import("effect")
+      const { Plugin } = await import("@opencode/plugin/tui")
+      const { createSignal } = await import(${JSON.stringify(solidPath)})
+      const sources = createPluginSources(async () => {})
+      try {
+        const loaded = (await sources.read(${JSON.stringify(pathToFileURL(pluginEntry).href)})).module as {
+          captured: { Plugin: unknown; createSignal: unknown; Effect: unknown; nominal: unknown }
+        }
+        assert.equal(loaded.captured.Plugin, Plugin)
+        assert.equal(loaded.captured.createSignal, createSignal)
+        assert.equal(loaded.captured.Effect, Effect)
+        assert.equal(loaded.captured.nominal, Brand.nominal)
+        console.log("order passed:", ${JSON.stringify(order)})
+      } finally {
+        sources.dispose()
+      }`,
+    )
+
+    const child = Bun.spawn([process.execPath, probe], {
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [stdout, stderr, exit] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ stdout: stdout.trim(), stderr, exit }).toEqual({
+      stdout: `order passed: ${order}`,
+      stderr: "",
+      exit: 0,
+    })
+  },
+)
 
 test("helper import.meta stays anchored to its source, including assets and resolution", async () => {
   await using sources = await fixture()
