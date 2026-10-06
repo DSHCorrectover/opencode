@@ -17,14 +17,11 @@ export function discoverPluginRuntimeSpecifiers(
 ): ReadonlyMap<string, string> {
   const entries = new Map<string, string>()
   for (const pkgName of packages) {
-    const realDir = realpathSync(path.dirname(Bun.resolveSync(`${pkgName}/package.json`, from)))
+    const realDir = path.dirname(Bun.resolveSync(`${pkgName}/package.json`, from))
     const loadDir = findNodeModulesDir(pkgName, from, realDir)
-    const toLoadPath = (resolved: string) => {
-      const real = realpathSync(resolved)
-      const rel = path.relative(realDir, real)
-      return !rel.startsWith("..") && !path.isAbsolute(rel) ? path.join(loadDir, rel) : real
-    }
-    const rootEntry = realpathSync(Bun.resolveSync(pkgName, from))
+    const toLoadPath = (resolved: string) =>
+      loadDir === realDir ? resolved : path.join(loadDir, path.relative(realDir, resolved))
+    const rootEntry = Bun.resolveSync(pkgName, from)
     const relParts = path.relative(realDir, rootEntry).replaceAll("\\", "/").split("/")
     const scanDir = relParts.length > 1 ? path.join(realDir, relParts[0]) : realDir
     const ext = path.extname(rootEntry) || ".js"
@@ -56,42 +53,35 @@ export function pluginRuntimeLoaderCode(specifier: string, entries: ReadonlyMap<
     const member = specifier.slice(slash + 1)
     const parentResolved = entries.get(parent)
     const resolved = entries.get(specifier)
-    if (member !== "index" && parentResolved && resolved) {
-      try {
-        if ((require(parentResolved) as Record<string, unknown>)[member] === require(resolved)) {
-          return `() => require(${JSON.stringify(parent)})[${JSON.stringify(member)}]`
-        }
-      } catch {}
+    if (
+      member !== "index" &&
+      parentResolved &&
+      resolved &&
+      (require(parentResolved) as Record<string, unknown>)[member] === require(resolved)
+    ) {
+      return `() => require(${JSON.stringify(parent)})[${JSON.stringify(member)}]`
     }
   }
   return `() => require(${JSON.stringify(specifier)})`
 }
 
-export function ensurePluginRuntime(): Readonly<Record<string, RuntimeModuleLoader>> {
+export function ensurePluginRuntime() {
   if (typeof Bun === "undefined") return {}
   const state = globalThis as GlobalState
   if (state[runtimeModulesKey]) return state[runtimeModulesKey]
-  const specifierByRealPath = new Map<string, string>()
   const modules =
     prebundledModules ??
-    (() => {
-      const entries = discoverPluginRuntimeSpecifiers()
-      for (const [specifier, resolved] of entries) {
-        const real = realpathSync(resolved)
-        if (!specifierByRealPath.has(real) || specifier.length < specifierByRealPath.get(real)!.length) {
-          specifierByRealPath.set(real, specifier)
-        }
-      }
-      for (const entry of ["effect", "@opencode/plugin", "@opencode/plugin/effect", "@opencode/plugin/rpc", "@opencode/plugin/host"]) {
-        const resolved = entries.get(entry)
-        if (resolved) require(resolved)
-      }
-      return Object.fromEntries(
-        [...entries.entries()].map(([specifier, resolved]) => [specifier, createLoader(resolved)]),
-      )
-    })()
+    Object.fromEntries(
+      [...discoverPluginRuntimeSpecifiers().entries()].map(([specifier, resolved]) => [
+        specifier,
+        createLoader(resolved),
+      ]),
+    )
   state[runtimeModulesKey] = modules
   const foreignFilter = createForeignPackageFilter()
+  const hostPluginDir = prebundledModules
+    ? undefined
+    : path.dirname(Bun.resolveSync("@opencode/plugin/package.json", import.meta.dir))
   Bun.plugin({
     name: "opencode-plugin-runtime",
     setup(build) {
@@ -104,15 +94,17 @@ export function ensurePluginRuntime(): Readonly<Record<string, RuntimeModuleLoad
           return { exports, loader: "object" }
         })
       }
-      build.onResolve(
-        { filter: /^file:\/\// },
-        (args) => {
-          const matched = resolveRewrittenHostSpecifier(args.path, modules, specifierByRealPath)
-          return matched ? { path: matched } : undefined
-        },
-      )
+      // Temporary until OpenTUI preserves host specifiers (anomalyco/opentui#1569).
+      build.onResolve({ filter: /^file:\/\// }, (args) => {
+        const matched = resolveRewrittenHostSpecifier(args.path, modules, hostPluginDir)
+        return matched ? { path: matched } : undefined
+      })
       build.onLoad({ filter: foreignFilter }, (args) => {
-        throw formatForeignPackageError(args.path)
+        const match = args.path.replaceAll("\\", "/").match(/\/node_modules\/((?:@opencode\/plugin|effect)\/.+)$/)
+        const target = match ? match[1] : args.path
+        throw new Error(
+          `Cannot load "${target}" from plugin node_modules: "${target}" is not provided by OpenCode; plugins must use the host's "effect" and "@opencode/plugin" modules.`,
+        )
       })
     },
   })
@@ -126,20 +118,15 @@ export function createLoader(resolved: string): RuntimeModuleLoader {
     if (cached) return cached
     if (pending) return pending
     try {
-      cached = require(resolved) as Record<string, unknown>
-      return cached
+      return (cached = require(resolved) as Record<string, unknown>)
     } catch {
-      pending = import(pathToFileURL(resolved).href).then(
-        (mod: Record<string, unknown>) => {
-          cached = mod
-          return mod
-        },
+      return (pending = import(pathToFileURL(resolved).href).then(
+        (mod: Record<string, unknown>) => (cached = mod),
         (error) => {
           pending = undefined
           throw error
         },
-      )
-      return pending
+      ))
     }
   }
 }
@@ -151,10 +138,8 @@ export function createForeignPackageFilter(rootsInput?: Iterable<string>) {
   if (!rootsInput) {
     for (const pkgName of ["effect", "@opencode/plugin"]) {
       const dir = path.dirname(Bun.resolveSync(`${pkgName}/package.json`, import.meta.dir))
-      const realDir = realpathSync(dir)
       roots.add(dir)
-      roots.add(realDir)
-      roots.add(findNodeModulesDir(pkgName, import.meta.dir, realDir))
+      roots.add(findNodeModulesDir(pkgName, import.meta.dir, dir))
     }
   }
   const escaped = [...roots]
@@ -168,11 +153,10 @@ export function createForeignPackageFilter(rootsInput?: Iterable<string>) {
 }
 
 function findNodeModulesDir(pkgName: string, from: string, realDir: string) {
+  if (/[/\\]node_modules[/\\]/.test(realDir)) return realDir
   for (let dir = path.resolve(from); ; dir = path.dirname(dir)) {
     const candidate = path.join(dir, "node_modules", pkgName)
-    try {
-      if (existsSync(candidate) && realpathSync(candidate) === realDir) return candidate
-    } catch {}
+    if (existsSync(candidate) && realpathSync(candidate) === realDir) return candidate
     if (path.dirname(dir) === dir) return realDir
   }
 }
@@ -180,22 +164,17 @@ function findNodeModulesDir(pkgName: string, from: string, realDir: string) {
 function resolveRewrittenHostSpecifier(
   fileUrl: string,
   modules: Readonly<Record<string, unknown>>,
-  specifierByRealPath: ReadonlyMap<string, string>,
+  hostPluginDir?: string,
 ) {
-  let targetPath: string
-  try {
-    targetPath = fileURLToPath(fileUrl)
-  } catch {
-    return undefined
-  }
-  try {
-    const direct = specifierByRealPath.get(realpathSync(targetPath))
-    if (direct) return direct
-  } catch {}
+  const targetPath = fileURLToPath(fileUrl)
   const match = targetPath.match(/^(.*)[/\\]node_modules[/\\](@opencode[/\\]plugin|effect)[/\\](.+)$/)
-  if (!match) return undefined
-  const [, ownerDir, rawPkg, rawSubpath] = match
-  const pkgName = rawPkg.replaceAll("\\", "/")
+  const rel = !match && hostPluginDir ? path.relative(hostPluginDir, targetPath) : undefined
+  if (!match && (!rel || rel.startsWith("..") || path.isAbsolute(rel))) return undefined
+  if (!existsSync(targetPath)) return undefined
+  const ownerDir = match ? match[1] || "/" : import.meta.dir
+  const pkgName = match ? match[2].replaceAll("\\", "/") : "@opencode/plugin"
+  const rawSubpath = match ? match[3] : rel!
+  const targetReal = realpathSync(targetPath)
   const base = rawSubpath
     .replaceAll("\\", "/")
     .replace(/^(?:dist|src)\//, "")
@@ -203,21 +182,12 @@ function resolveRewrittenHostSpecifier(
   const candidates = base.endsWith("/index")
     ? [pkgName, `${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`]
     : [pkgName, `${pkgName}/${base}`]
-  for (const candidate of candidates) {
-    if (!(candidate in modules)) continue
+  return candidates.find((candidate) => {
+    if (!(candidate in modules)) return false
     try {
-      if (realpathSync(Bun.resolveSync(candidate, ownerDir || "/")) === realpathSync(targetPath)) {
-        return candidate
-      }
-    } catch {}
-  }
-  return undefined
-}
-
-function formatForeignPackageError(filePath: string) {
-  const match = filePath.replaceAll("\\", "/").match(/\/node_modules\/((?:@opencode\/plugin|effect)\/.+)$/)
-  const target = match ? match[1] : filePath
-  return new Error(
-    `Cannot load "${target}" from plugin node_modules: "${target}" is not provided by OpenCode; plugins must use the host's "effect" and "@opencode/plugin" modules.`,
-  )
+      return Bun.resolveSync(candidate, ownerDir) === targetReal
+    } catch {
+      return false
+    }
+  })
 }

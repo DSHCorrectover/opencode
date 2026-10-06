@@ -123,7 +123,6 @@ it.live("loads plugins and their transitive dependencies against the host's Effe
         filter: (src) => !src.endsWith(".d.ts") && !src.endsWith(".map") && !/httpApi(?:Scalar|Swagger)\.js$/.test(src),
       })
       const pkg = { ...(await Bun.file(path.join(hostEffectDir, "package.json")).json()), version: "4.0.0-rc.111" }
-      await Bun.write(path.join(pluginEffectDir, "package.json"), JSON.stringify(pkg))
 
       // Sabotage the plugin's own Effect copy with the version-skew failure modes so loading it would crash:
       // 1. Effect.log reading an incompatible fiber log-level property (crashing host logger with logLevel.toUpperCase)
@@ -136,9 +135,10 @@ it.live("loads plugins and their transitive dependencies against the host's Effe
       const runPromisePattern = /const runPromiseExit = runPromiseExitWith\(context\);/
       expect(logPattern.test(originalInternalEffect)).toBe(true)
       expect(runPromisePattern.test(originalInternalEffect)).toBe(true)
-      await Bun.write(
-        internalEffectPath,
-        originalInternalEffect
+
+      await writeFiles(pluginDir, {
+        "node_modules/effect/package.json": JSON.stringify(pkg),
+        "node_modules/effect/dist/internal/effect.js": originalInternalEffect
           .replace(
             logPattern,
             "const logLevel = level ?? fiber.foreignSkew?.logLevel;\n    if (isLogLevelGreaterThan(fiber.foreignSkew?.minimumLogLevel, logLevel)) {",
@@ -147,16 +147,9 @@ it.live("loads plugins and their transitive dependencies against the host's Effe
             runPromisePattern,
             "if (true) return (effect) => Promise.resolve().then(() => { const fiber = {}; return fiber.succeedWith(effect); });\n  const runPromiseExit = runPromiseExitWith(context);",
           ),
-      )
-
-      const depDir = path.join(pluginDir, "node_modules/transitive-dep")
-      await Bun.write(
-        path.join(depDir, "package.json"),
-        '{"name":"transitive-dep","type":"module","exports":{".":"./index.js"}}',
-      )
-      await Bun.write(
-        path.join(depDir, "index.js"),
-        `import { Effect, Schema } from "effect"
+        "node_modules/transitive-dep/package.json":
+          '{"name":"transitive-dep","type":"module","exports":{".":"./index.js"}}',
+        "node_modules/transitive-dep/index.js": `import { Effect, Schema } from "effect"
 import { some } from "effect/Option"
 export const depToolInput = Schema.Struct({
   mode: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("from-dep"))),
@@ -164,19 +157,11 @@ export const depToolInput = Schema.Struct({
   code: Schema.Trim.check(Schema.isPattern(/^v[0-9]+$/)),
 })
 export const depCaptured = { Effect, Schema, some }`,
-      )
-
-      const foreignPluginPkgDir = path.join(pluginDir, "node_modules/@opencode/plugin")
-      await Bun.write(
-        path.join(foreignPluginPkgDir, "package.json"),
-        '{"name":"@opencode/plugin","type":"module","exports":{"./effect":"./effect.js","./rpc":"./rpc.js"}}',
-      )
-      await Bun.write(path.join(foreignPluginPkgDir, "effect.js"), "export const Plugin = { define: (p) => p }")
-      await Bun.write(path.join(foreignPluginPkgDir, "rpc.js"), "export const Rpc = { define: (d) => d }")
-
-      await Bun.write(
-        path.join(pluginDir, "index.ts"),
-        `import { Plugin } from "@opencode/plugin/effect"
+        "node_modules/@opencode/plugin/package.json":
+          '{"name":"@opencode/plugin","type":"module","exports":{"./effect":"./effect.js","./rpc":"./rpc.js"}}',
+        "node_modules/@opencode/plugin/effect.js": "export const Plugin = { define: (p) => p }",
+        "node_modules/@opencode/plugin/rpc.js": "export const Rpc = { define: (d) => d }",
+        "index.ts": `import { Plugin } from "@opencode/plugin/effect"
 import { Rpc } from "@opencode/plugin/rpc"
 import { Effect, Schema } from "effect"
 import { some } from "effect/Option"
@@ -237,7 +222,7 @@ export default Plugin.define({
       }).pipe(Effect.orDie)
     }),
 })`,
-      )
+      })
     })
 
     const modules = yield* PluginModule.make()
@@ -288,29 +273,19 @@ it.live("fails loudly at load when a plugin imports an unprovided effect/* subpa
     const okDir = path.join(directory.path, "pkg-json-plugin")
     const badDir = path.join(directory.path, "removed-subpath-plugin")
 
-    yield* Effect.promise(async () => {
-      await Bun.write(
-        path.join(okDir, "node_modules/effect/package.json"),
-        '{"name":"effect","version":"4.0.0-rc.111","type":"module","exports":{"./package.json":"./package.json"}}',
-      )
-      await Bun.write(
-        path.join(okDir, "index.ts"),
-        `import pkg from "effect/package.json" with { type: "json" }
-export const effectPkgName = pkg.name
-export default { id: "pkg-json-plugin", async setup() {} }`,
-      )
-
-      await Bun.write(
-        path.join(badDir, "node_modules/effect/package.json"),
-        '{"name":"effect","type":"module","exports":{"./RemovedLegacySubpath":"./RemovedLegacySubpath.js"}}',
-      )
-      await Bun.write(path.join(badDir, "node_modules/effect/RemovedLegacySubpath.js"), "export const legacy = true")
-      await Bun.write(
-        path.join(badDir, "index.ts"),
-        `import { legacy } from "effect/RemovedLegacySubpath"
-export default { id: "removed-subpath", async setup() { void legacy } }`,
-      )
-    })
+    yield* Effect.promise(() =>
+      writeFiles(directory.path, {
+        "pkg-json-plugin/node_modules/effect/package.json":
+          '{"name":"effect","version":"4.0.0-rc.111","type":"module","exports":{"./package.json":"./package.json"}}',
+        "pkg-json-plugin/index.ts":
+          'import pkg from "effect/package.json" with { type: "json" }; export const effectPkgName = pkg.name; export default { id: "pkg-json-plugin", async setup() {} }',
+        "removed-subpath-plugin/node_modules/effect/package.json":
+          '{"name":"effect","type":"module","exports":{"./RemovedLegacySubpath":"./RemovedLegacySubpath.js"}}',
+        "removed-subpath-plugin/node_modules/effect/RemovedLegacySubpath.js": "export const legacy = true",
+        "removed-subpath-plugin/index.ts":
+          'import { legacy } from "effect/RemovedLegacySubpath"; export default { id: "removed-subpath", async setup() { void legacy } }',
+      }),
+    )
 
     const modules = yield* PluginModule.make()
     expect(yield* modules.load({ type: "add", target: okDir, options: {} })).toMatchObject({ id: "pkg-json-plugin" })
@@ -328,43 +303,25 @@ it.live("redirects plugin dependencies with a nested Effect 3 installation to th
     const directory = yield* tmpdirScoped()
     const pluginDir = path.join(directory.path, "v3-dep-plugin")
     const v3DepDir = path.join(pluginDir, "node_modules/v3-dep")
-    const nestedEffect3Dir = path.join(v3DepDir, "node_modules/effect")
 
-    yield* Effect.promise(async () => {
-      await Bun.write(
-        path.join(nestedEffect3Dir, "package.json"),
-        '{"name":"effect","version":"3.19.19","type":"module","exports":{".":"./index.js","./Option":"./Option.js","./ReadonlyArray":"./ReadonlyArray.js"}}',
-      )
-      await Bun.write(
-        path.join(nestedEffect3Dir, "index.js"),
-        "export const Effect = { major: 3 }; export const Schema = { major: 3 }",
-      )
-      await Bun.write(path.join(nestedEffect3Dir, "Option.js"), "export const some = () => ({ major: 3 })")
-      await Bun.write(path.join(nestedEffect3Dir, "ReadonlyArray.js"), "export const fromIterable = () => []")
-
-      await Bun.write(
-        path.join(v3DepDir, "package.json"),
-        '{"name":"v3-dep","type":"module","exports":{".":"./index.js","./v3-only":"./v3-only.js"}}',
-      )
-      await Bun.write(
-        path.join(v3DepDir, "index.js"),
-        `import { Effect, Schema } from "effect"
-import { some } from "effect/Option"
-export const v3DepCaptured = { Effect, Schema, some }`,
-      )
-      await Bun.write(
-        path.join(v3DepDir, "v3-only.js"),
-        `import { fromIterable } from "effect/ReadonlyArray"
-export { fromIterable }`,
-      )
-
-      await Bun.write(
-        path.join(pluginDir, "index.ts"),
-        `import { v3DepCaptured } from "v3-dep"
-export { v3DepCaptured }
-export default { id: "v3-dep-plugin", async setup() {} }`,
-      )
-    })
+    yield* Effect.promise(() =>
+      writeFiles(pluginDir, {
+        "node_modules/v3-dep/node_modules/effect/package.json":
+          '{"name":"effect","version":"3.19.19","type":"module","exports":{".":"./index.js","./Option":"./Option.js","./ReadonlyArray":"./ReadonlyArray.js"}}',
+        "node_modules/v3-dep/node_modules/effect/index.js":
+          "export const Effect = { major: 3 }; export const Schema = { major: 3 }",
+        "node_modules/v3-dep/node_modules/effect/Option.js": "export const some = () => ({ major: 3 })",
+        "node_modules/v3-dep/node_modules/effect/ReadonlyArray.js": "export const fromIterable = () => []",
+        "node_modules/v3-dep/package.json":
+          '{"name":"v3-dep","type":"module","exports":{".":"./index.js","./v3-only":"./v3-only.js"}}',
+        "node_modules/v3-dep/index.js":
+          'import { Effect, Schema } from "effect"; import { some } from "effect/Option"; export const v3DepCaptured = { Effect, Schema, some }',
+        "node_modules/v3-dep/v3-only.js":
+          'import { fromIterable } from "effect/ReadonlyArray"; export { fromIterable }',
+        "index.ts":
+          'import { v3DepCaptured } from "v3-dep"; export { v3DepCaptured }; export default { id: "v3-dep-plugin", async setup() {} }',
+      }),
+    )
 
     const modules = yield* PluginModule.make()
     expect(yield* modules.load({ type: "add", target: pluginDir, options: {} })).toMatchObject({ id: "v3-dep-plugin" })
@@ -373,17 +330,9 @@ export default { id: "v3-dep-plugin", async setup() {} }`,
     expect(imported.v3DepCaptured.Effect).toBe(Effect)
     expect(imported.v3DepCaptured.Schema).toBe(Schema)
     expect(imported.v3DepCaptured.some).toBe(Option.some)
-
-    const v3OnlyExit = yield* Effect.promise(() =>
-      import(path.join(v3DepDir, "v3-only.js")).then(
-        () => ({ ok: true as const }),
-        (error: unknown) => ({ ok: false as const, error: String(error) }),
-      ),
-    )
-    expect(v3OnlyExit.ok).toBe(false)
-    if (!v3OnlyExit.ok) {
-      expect(v3OnlyExit.error).toContain("effect/ReadonlyArray.js")
-    }
+    yield* Effect.promise(async () => {
+      await expect(import(path.join(v3DepDir, "v3-only.js"))).rejects.toThrow("effect/ReadonlyArray.js")
+    })
   }),
 )
 
@@ -391,15 +340,12 @@ it.live("discovers exported specifiers from the resolved tree even when dist/ ex
   Effect.gen(function* () {
     const directory = yield* tmpdirScoped()
     const consumerDir = path.join(directory.path, "consumer")
-    const pkgDir = path.join(consumerDir, "node_modules/@opencode/plugin")
     const jitFixtureDir = path.join(directory.path, "jit-fixture")
     const asyncModPath = path.join(directory.path, "async-mod.ts")
 
-    yield* Effect.promise(async () => {
-      // 1. Package with exports pointing to ./src/*.ts AND a stale dist/ directory + unexported file in src/
-      await Bun.write(
-        path.join(pkgDir, "package.json"),
-        JSON.stringify({
+    yield* Effect.promise(() =>
+      writeFiles(directory.path, {
+        "consumer/node_modules/@opencode/plugin/package.json": JSON.stringify({
           name: "@opencode/plugin",
           type: "module",
           exports: {
@@ -408,26 +354,18 @@ it.live("discovers exported specifiers from the resolved tree even when dist/ ex
             "./effect/*": "./src/effect/*.ts",
           },
         }),
-      )
-      await Bun.write(path.join(pkgDir, "src/promise/index.ts"), "export const root = 'src'")
-      await Bun.write(path.join(pkgDir, "src/effect/index.ts"), "export * as plugin from './plugin.ts'")
-      await Bun.write(path.join(pkgDir, "src/effect/plugin.ts"), "export const leaf = 'src'")
-      await Bun.write(path.join(pkgDir, "src/unexported.ts"), "export const secret = true")
-      await Bun.write(path.join(pkgDir, "dist/promise/index.js"), "export const root = 'dist'")
-      await Bun.write(path.join(pkgDir, "dist/effect/index.js"), "export const index = 'dist'")
-      await Bun.write(path.join(pkgDir, "dist/effect/plugin.js"), "export const leaf = 'dist'")
-
-      // 2. SchemaJITCompiler/enable-shaped fixture where parent.enable is a function, not the child side-effect module
-      await Bun.write(path.join(jitFixtureDir, "SchemaJITCompiler.js"), "export const enable = () => 'fn'")
-      await Bun.write(path.join(jitFixtureDir, "enable.js"), "export {}")
-
-      // 3. Async module for createLoader concurrent deduplication check
-      await Bun.write(
-        asyncModPath,
-        `await new Promise((r) => setTimeout(r, 20))
-export const nonce = Math.random()`,
-      )
-    })
+        "consumer/node_modules/@opencode/plugin/src/promise/index.ts": "export const root = 'src'",
+        "consumer/node_modules/@opencode/plugin/src/effect/index.ts": "export * as plugin from './plugin.ts'",
+        "consumer/node_modules/@opencode/plugin/src/effect/plugin.ts": "export const leaf = 'src'",
+        "consumer/node_modules/@opencode/plugin/src/unexported.ts": "export const secret = true",
+        "consumer/node_modules/@opencode/plugin/dist/promise/index.js": "export const root = 'dist'",
+        "consumer/node_modules/@opencode/plugin/dist/effect/index.js": "export const index = 'dist'",
+        "consumer/node_modules/@opencode/plugin/dist/effect/plugin.js": "export const leaf = 'dist'",
+        "jit-fixture/SchemaJITCompiler.js": "export const enable = () => 'fn'",
+        "jit-fixture/enable.js": "export {}",
+        "async-mod.ts": "await new Promise((r) => setTimeout(r, 20)); export const nonce = Math.random()",
+      }),
+    )
 
     const discovered = discoverPluginRuntimeSpecifiers(consumerDir, ["@opencode/plugin"])
     expect(discovered.get("@opencode/plugin")?.replaceAll("\\", "/")).toEndWith("src/promise/index.ts")
@@ -462,3 +400,7 @@ export const nonce = Math.random()`,
     expect(winFilter.test("C:/Users/plugin/node_modules/effect/dist/index.js")).toBe(true)
   }),
 )
+
+async function writeFiles(root: string, files: Record<string, string>) {
+  await Promise.all(Object.entries(files).map(([file, text]) => Bun.write(path.join(root, file), text)))
+}
