@@ -103,24 +103,16 @@ export const resolveChange = Effect.fnUntraced(function* (
 export function parseModelSelection(value: string, models: ReadonlyArray<Model.Info>): Model.Ref {
   const exact = models.find((model) => advertisedModel(model) === value)
   if (exact) return { providerID: exact.providerID, id: exact.id }
-  const providerID = models
-    .map((model) => model.providerID)
-    .toSorted()
-    .find((id) => value.startsWith(`${id}/`))
-  if (!providerID) {
-    const separator = value.indexOf("/")
-    if (separator === -1) return { providerID: Provider.ID.make(value), id: Model.ID.make("") }
-    return { providerID: Provider.ID.make(value.slice(0, separator)), id: Model.ID.make(value.slice(separator + 1)) }
-  }
-  const id = Model.ID.make(value.slice(providerID.length + 1))
-  if (findModel(models, { providerID, id })) return { providerID, id }
-  const separator = id.lastIndexOf("/")
-  const baseID = Model.ID.make(separator === -1 ? id : id.slice(0, separator))
-  const variant = separator === -1 ? undefined : id.slice(separator + 1)
-  const model = findModel(models, { providerID, id: baseID })
-  if (model && variant && model.variants.some((item) => item.id === variant))
-    return { providerID, id: baseID, variant: Model.VariantID.make(variant) }
-  return { providerID, id }
+  const separator = value.lastIndexOf("/")
+  const variant = Model.VariantID.make(value.slice(separator + 1))
+  const base = models.find(
+    (model) =>
+      advertisedModel(model) === value.slice(0, separator) && model.variants.some((item) => item.id === variant),
+  )
+  if (base) return { providerID: base.providerID, id: base.id, variant }
+  const providerEnd = value.indexOf("/")
+  if (providerEnd === -1) return { providerID: Provider.ID.make(value), id: Model.ID.make("") }
+  return { providerID: Provider.ID.make(value.slice(0, providerEnd)), id: Model.ID.make(value.slice(providerEnd + 1)) }
 }
 
 const requireModel = Effect.fnUntraced(function* (catalog: Catalog, value: string, current: Model.Ref) {

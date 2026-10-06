@@ -36,6 +36,7 @@ describe("acp catalog and config options over the wire", () => {
     })
     const overlap = "test/sub/second-model"
     expect(currentValue(await set("model", overlap), "model")).toBe(overlap)
+    expect(currentValue(await set("model", `${overlap}/low`), "effort")).toBe("low")
   })
 
   test("answers the first session after a cold location activates its plugins (#52729, #52472)", async () => {
