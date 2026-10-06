@@ -14,7 +14,13 @@ import { Tool } from "@opencode/core/tool"
 import { execute } from "@opencode/core/tool/runtime"
 import { Global } from "@opencode/util/global"
 import { Npm } from "@opencode/util/npm"
-import { ensurePluginRuntime } from "../../../cli/src/plugin-runtime"
+import {
+  createForeignPackageFilter,
+  createLoader,
+  discoverPluginRuntimeSpecifiers,
+  ensurePluginRuntime,
+  pluginRuntimeLoaderCode,
+} from "../../../cli/src/plugin-runtime"
 import { tempGlobalLayer } from "../fixture/global"
 import { tmpdirScoped } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
@@ -124,15 +130,21 @@ it.live("loads plugins and their transitive dependencies against the host's Effe
       // 2. Effect.runPromise calling fiber.succeedWith on a host fiber
       // 3. Schema.withDecodingDefault / Schema.Int / Schema.isPattern / Schema.Trim using foreign parser sentinels
       const internalEffectPath = path.join(pluginEffectDir, "dist/internal/effect.js")
+      const originalInternalEffect = await Bun.file(internalEffectPath).text()
+      const logPattern =
+        /const logLevel = level \?\? fiber\.(?:currentLogLevel|cache\.logLevel);\r?\n\s*if \(isLogLevelGreaterThan\(fiber\.(?:minimumLogLevel|cache\.minimumLogLevel), logLevel\)\) \{/
+      const runPromisePattern = /const runPromiseExit = runPromiseExitWith\(context\);/
+      expect(logPattern.test(originalInternalEffect)).toBe(true)
+      expect(runPromisePattern.test(originalInternalEffect)).toBe(true)
       await Bun.write(
         internalEffectPath,
-        (await Bun.file(internalEffectPath).text())
+        originalInternalEffect
           .replace(
-            "const logLevel = level ?? fiber.currentLogLevel;\n    if (isLogLevelGreaterThan(fiber.minimumLogLevel, logLevel)) {",
-            "const logLevel = level ?? fiber.cache?.logLevel;\n    if (isLogLevelGreaterThan(fiber.cache?.minimumLogLevel, logLevel)) {",
+            logPattern,
+            "const logLevel = level ?? fiber.foreignSkew?.logLevel;\n    if (isLogLevelGreaterThan(fiber.foreignSkew?.minimumLogLevel, logLevel)) {",
           )
           .replace(
-            "const runPromiseExit = runPromiseExitWith(context);",
+            runPromisePattern,
             "if (true) return (effect) => Promise.resolve().then(() => { const fiber = {}; return fiber.succeedWith(effect); });\n  const runPromiseExit = runPromiseExitWith(context);",
           ),
       )
@@ -372,5 +384,81 @@ export default { id: "v3-dep-plugin", async setup() {} }`,
     if (!v3OnlyExit.ok) {
       expect(v3OnlyExit.error).toContain("effect/ReadonlyArray.js")
     }
+  }),
+)
+
+it.live("discovers exported specifiers from the resolved tree even when dist/ exists, and validates barrel loader routing, async loader dedup, and Windows foreign filters", () =>
+  Effect.gen(function* () {
+    const directory = yield* tmpdirScoped()
+    const consumerDir = path.join(directory.path, "consumer")
+    const pkgDir = path.join(consumerDir, "node_modules/@opencode/plugin")
+    const jitFixtureDir = path.join(directory.path, "jit-fixture")
+    const asyncModPath = path.join(directory.path, "async-mod.ts")
+
+    yield* Effect.promise(async () => {
+      // 1. Package with exports pointing to ./src/*.ts AND a stale dist/ directory + unexported file in src/
+      await Bun.write(
+        path.join(pkgDir, "package.json"),
+        JSON.stringify({
+          name: "@opencode/plugin",
+          type: "module",
+          exports: {
+            ".": "./src/promise/index.ts",
+            "./effect": "./src/effect/index.ts",
+            "./effect/*": "./src/effect/*.ts",
+          },
+        }),
+      )
+      await Bun.write(path.join(pkgDir, "src/promise/index.ts"), "export const root = 'src'")
+      await Bun.write(path.join(pkgDir, "src/effect/index.ts"), "export * as plugin from './plugin.ts'")
+      await Bun.write(path.join(pkgDir, "src/effect/plugin.ts"), "export const leaf = 'src'")
+      await Bun.write(path.join(pkgDir, "src/unexported.ts"), "export const secret = true")
+      await Bun.write(path.join(pkgDir, "dist/promise/index.js"), "export const root = 'dist'")
+      await Bun.write(path.join(pkgDir, "dist/effect/index.js"), "export const index = 'dist'")
+      await Bun.write(path.join(pkgDir, "dist/effect/plugin.js"), "export const leaf = 'dist'")
+
+      // 2. SchemaJITCompiler/enable-shaped fixture where parent.enable is a function, not the child side-effect module
+      await Bun.write(path.join(jitFixtureDir, "SchemaJITCompiler.js"), "export const enable = () => 'fn'")
+      await Bun.write(path.join(jitFixtureDir, "enable.js"), "export {}")
+
+      // 3. Async module for createLoader concurrent deduplication check
+      await Bun.write(
+        asyncModPath,
+        `await new Promise((r) => setTimeout(r, 20))
+export const nonce = Math.random()`,
+      )
+    })
+
+    const discovered = discoverPluginRuntimeSpecifiers(consumerDir, ["@opencode/plugin"])
+    expect(discovered.get("@opencode/plugin")?.replaceAll("\\", "/")).toEndWith("src/promise/index.ts")
+    expect(discovered.get("@opencode/plugin/effect")?.replaceAll("\\", "/")).toEndWith("src/effect/index.ts")
+    expect(discovered.get("@opencode/plugin/effect/plugin")?.replaceAll("\\", "/")).toEndWith("src/effect/plugin.ts")
+    expect(discovered.has("@opencode/plugin/unexported")).toBe(false)
+
+    const hostDiscovered = new Map(discoverPluginRuntimeSpecifiers())
+    hostDiscovered.set("effect/schema/SchemaJITCompiler", path.join(jitFixtureDir, "SchemaJITCompiler.js"))
+    hostDiscovered.set("effect/schema/SchemaJITCompiler/enable", path.join(jitFixtureDir, "enable.js"))
+    expect(pluginRuntimeLoaderCode("effect/Option", hostDiscovered)).toBe('() => require("effect")["Option"]')
+    expect(pluginRuntimeLoaderCode("effect/testing", hostDiscovered)).toBe('() => require("effect/testing")')
+    expect(pluginRuntimeLoaderCode("effect/unstable/http/MultipartParser/HeadersParser", hostDiscovered)).toBe(
+      '() => require("effect/unstable/http/MultipartParser/HeadersParser")',
+    )
+    expect(pluginRuntimeLoaderCode("effect/schema/SchemaJITCompiler/enable", hostDiscovered)).toBe(
+      '() => require("effect/schema/SchemaJITCompiler/enable")',
+    )
+
+    const loadAsync = createLoader(asyncModPath)
+    const first = loadAsync()
+    const second = loadAsync()
+    expect(first).toBeInstanceOf(Promise)
+    expect(first).toBe(second)
+    const [res1, res2] = yield* Effect.promise(() => Promise.all([first, second]))
+    expect(res1).toBe(res2)
+
+    const winFilter = createForeignPackageFilter(["C:\\runner\\_work\\opencode\\node_modules\\effect"])
+    expect(winFilter.test("C:\\runner\\_work\\opencode\\node_modules\\effect\\dist\\index.js")).toBe(false)
+    expect(winFilter.test("C:/runner/_work/opencode/node_modules/effect/dist/index.js")).toBe(false)
+    expect(winFilter.test("C:\\Users\\plugin\\node_modules\\effect\\dist\\index.js")).toBe(true)
+    expect(winFilter.test("C:/Users/plugin/node_modules/effect/dist/index.js")).toBe(true)
   }),
 )

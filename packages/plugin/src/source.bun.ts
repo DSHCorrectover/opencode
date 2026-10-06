@@ -7,6 +7,11 @@ import { localSource } from "./source.js"
 import { missingPackageTarget } from "./source.package.js"
 
 let generation = Date.now()
+const runtimeModulesKey = Symbol.for("opencode.plugin.runtime-modules")
+
+type GlobalState = typeof globalThis & {
+  [runtimeModulesKey]?: Readonly<Record<string, unknown>>
+}
 
 export async function prepareSource(entrypoint: string, track: (file: string, directory?: boolean) => void) {
   const root = fileURLToPath(entrypoint)
@@ -39,6 +44,7 @@ export async function prepareSource(entrypoint: string, track: (file: string, di
           ? new URL(item.path, pathToFileURL(file))
           : localSource(item.path, path.dirname(file))
       if (!local) {
+        if ((globalThis as GlobalState)[runtimeModulesKey]?.[item.path]) continue
         try {
           Bun.resolveSync(item.path, path.dirname(file))
         } catch {

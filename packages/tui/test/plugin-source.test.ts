@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test"
+import { createRequire } from "node:module"
 import path from "node:path"
 import { mkdir, rename, symlink } from "node:fs/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { Host } from "@opencode/plugin/host"
+import { Plugin as EffectPlugin } from "@opencode/plugin/effect"
 import "../src/plugin/runtime-plugin-support.bun"
 import { createPluginSources } from "../src/plugin/source"
 import { createSourceWatcher } from "../src/plugin/watch"
@@ -139,8 +141,17 @@ test("shared runtime and ordinary package identities survive plugin generations"
   }
 })
 
-test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect resolve effect and effect/* to the host copy", async () => {
-  await using sources = await fixture()
+test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect resolve effect and effect/* to the host copy without rewriting host Effect or hijacking plugin dependencies", async () => {
+  const req = createRequire(import.meta.url)
+  expect(req("effect").Effect).toBe(Effect)
+  expect(req("effect/Option").some).toBe(Option.some)
+  expect(req("@opencode/plugin/effect").Plugin).toBe(EffectPlugin)
+  expect(JSON.stringify(Schema.Option(Schema.String).ast)).not.toContain("opentui:runtime-module:")
+
+  const watched: string[] = []
+  await using sources = await fixture(async (file) => {
+    watched.push(file)
+  })
   const entry = new URL("tui.ts", sources.url)
   await Bun.write(
     new URL("node_modules/effect/package.json", sources.url),
@@ -161,14 +172,22 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
     'import { Effect, Schema } from "effect"; import { some } from "effect/Option"; export const helper = { Effect, Schema, some }',
   )
   await Bun.write(
+    new URL("node_modules/zod/package.json", sources.url),
+    '{"name":"zod","type":"module","exports":{".":"./index.js"}}',
+  )
+  await Bun.write(new URL("node_modules/zod/index.js", sources.url), "export const fromPluginZod = true")
+  await Bun.write(new URL("helper.ts", sources.url), 'import { fromPluginZod } from "zod"; export { fromPluginZod }')
+  await Bun.write(
     entry,
     `import { createSignal } from "solid-js"
     import { Plugin } from "@opencode/plugin/tui"
+    import { Plugin as HostEffectPlugin } from "@opencode/plugin/effect"
     import { Effect, Schema } from "effect"
     import { some } from "effect/Option"
     import pkg from "effect/package.json" with { type: "json" }
     import { helper } from "effect-helper"
-    export const plugin = { createSignal, Plugin, Effect, Schema, some, pkgName: pkg.name }
+    const { fromPluginZod } = await import("./helper.ts")
+    export const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, pkgName: pkg.name, fromPluginZod }
     export { helper }`,
   )
   const loaded = (await sources.read(entry.href)).module as {
@@ -177,13 +196,17 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
   }
   expect(loaded.plugin.createSignal).toBe(createSignal)
   expect(loaded.plugin.Plugin).toBe(Plugin)
+  expect(loaded.plugin.HostEffectPlugin).toBe(EffectPlugin)
   expect(loaded.plugin.Effect).toBe(Effect)
   expect(loaded.plugin.Schema).toBe(Schema)
   expect(loaded.plugin.some).toBe(Option.some)
   expect(loaded.plugin.pkgName).toBe("effect")
+  expect(loaded.plugin.fromPluginZod).toBe(true)
   expect(loaded.helper.Effect).toBe(Effect)
   expect(loaded.helper.Schema).toBe(Schema)
   expect(loaded.helper.some).toBe(Option.some)
+  expect(watched.some((item) => item.replaceAll("\\", "/").endsWith("/node_modules/effect"))).toBe(false)
+  expect(watched.some((item) => item.replaceAll("\\", "/").endsWith("/node_modules/@opencode/plugin"))).toBe(false)
 
   const badEntry = new URL("bad-tui.ts", sources.url)
   await Bun.write(
@@ -217,15 +240,21 @@ test.each(["cli-first", "opentui-first"] as const)(
     await Bun.write(
       probe,
       `import assert from "node:assert/strict"
+      import { createRequire } from "node:module"
       if (${JSON.stringify(order)} === "cli-first") {
         const { ensurePluginRuntime } = await import(${JSON.stringify(fileURLToPath(new URL("../../cli/src/plugin-runtime.ts", import.meta.url)))})
         ensurePluginRuntime()
       }
       await import(${JSON.stringify(fileURLToPath(new URL("../src/plugin/runtime-plugin-support.bun.ts", import.meta.url)))})
       const { createPluginSources } = await import(${JSON.stringify(fileURLToPath(new URL("../src/plugin/source.ts", import.meta.url)))})
-      const { Effect, Brand } = await import("effect")
+      const { Effect, Brand, Option, Schema } = await import("effect")
       const { Plugin } = await import("@opencode/plugin/tui")
+      const { Plugin: EffectPlugin } = await import("@opencode/plugin/effect")
       const { createSignal } = await import(${JSON.stringify(Bun.resolveSync("solid-js", import.meta.dir))})
+      const req = createRequire(import.meta.url)
+      assert.equal(req("effect/Option").some, Option.some)
+      assert.equal(req("@opencode/plugin/effect").Plugin, EffectPlugin)
+      assert.equal(JSON.stringify(Schema.Option(Schema.String).ast).includes("opentui:runtime-module:"), false)
       const sources = createPluginSources(async () => {})
       try {
         const loaded = (await sources.read(${JSON.stringify(pathToFileURL(pluginEntry).href)})).module as {

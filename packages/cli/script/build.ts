@@ -7,7 +7,7 @@ import { Script } from "@opencode/script"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import type { BunPlugin } from "bun"
 import pkg from "../package.json"
-import { discoverPluginRuntimeSpecifiers } from "../src/plugin-runtime"
+import { discoverPluginRuntimeSpecifiers, pluginRuntimeLoaderCode } from "../src/plugin-runtime"
 import { buildAppArchive } from "./app-assets"
 import { verifyArtifact, verifySimulationGraph } from "./verify-artifact"
 import { resolveOpencodePty } from "./opencode-pty"
@@ -79,55 +79,23 @@ const appAssetsPlugin: BunPlugin = {
     }))
   },
 }
-const pluginRuntimeSpecifiers = discoverPluginRuntimeSpecifiers()
-const pluginRuntimeLoaderCode = (specifier: string) => {
-  if (specifier.startsWith("effect/")) {
-    const subpath = specifier.slice("effect/".length)
-    const slash = subpath.lastIndexOf("/")
-    const parent = slash === -1 ? "effect" : `effect/${subpath.slice(0, slash)}`
-    const member = slash === -1 ? subpath : subpath.slice(slash + 1)
-    const parentPath = pluginRuntimeSpecifiers.get(parent)
-    if (parentPath && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(member) && member in require(parentPath)) {
-      return `() => require(${JSON.stringify(parent)}).${member}`
-    }
-  }
-  return `() => require(${JSON.stringify(specifier)})`
+const pluginRuntimeEntries = discoverPluginRuntimeSpecifiers()
+const pluginRuntimeTemplate = await Bun.file("./src/plugin-runtime.ts").text()
+const pluginRuntimeMarker =
+  "const prebundledModules: Readonly<Record<string, RuntimeModuleLoader>> | undefined = undefined"
+if (!pluginRuntimeTemplate.includes(pluginRuntimeMarker)) {
+  throw new Error("Missing prebundledModules marker in packages/cli/src/plugin-runtime.ts")
 }
-const pluginRuntimeSource = `const runtimeModulesKey = Symbol.for("opencode.plugin.runtime-modules")
-const modules = {
-${[...pluginRuntimeSpecifiers.keys()].map((specifier) => `  ${JSON.stringify(specifier)}: ${pluginRuntimeLoaderCode(specifier)},`).join("\n")}
-}
-export function ensurePluginRuntime() {
-  const state = globalThis
-  if (state[runtimeModulesKey]) return state[runtimeModulesKey]
-  state[runtimeModulesKey] = modules
-  Bun.plugin({
-    name: "opencode-plugin-runtime",
-    setup(build) {
-      for (const [specifier, load] of Object.entries(modules)) {
-        build.module(specifier, () => ({ exports: load(), loader: "object" }))
-      }
-      build.onLoad(
-        { filter: /[/\\\\]node_modules[/\\\\](?:effect|@opencode[/\\\\]plugin)[/\\\\].*\\.[cm]?[jt]sx?(?:[?#].*)?$/ },
-        (args) => {
-          const match = args.path.replaceAll("\\\\", "/").match(/\\/node_modules\\/((?:@opencode\\/plugin|effect)\\/.+)$/)
-          const target = match ? match[1] : args.path
-          throw new Error(
-            \`Cannot load "\${target}" from plugin node_modules: "\${target}" is not provided by OpenCode; plugins must use the host's "effect" and "@opencode/plugin" modules.\`,
-          )
-        },
-      )
-    },
-  })
-  return modules
-}
-`
+const pluginRuntimeSource = pluginRuntimeTemplate.replace(
+  pluginRuntimeMarker,
+  `const prebundledModules: Readonly<Record<string, RuntimeModuleLoader>> | undefined = {\n${[...pluginRuntimeEntries.keys()].map((specifier) => `  ${JSON.stringify(specifier)}: ${pluginRuntimeLoaderCode(specifier, pluginRuntimeEntries)},`).join("\n")}\n}`,
+)
 const pluginRuntimePlugin: BunPlugin = {
   name: "opencode-plugin-runtime",
   setup(build) {
     build.onLoad({ filter: /cli[/\\]src[/\\]plugin-runtime\.ts$/ }, () => ({
       contents: pluginRuntimeSource,
-      loader: "js",
+      loader: "ts",
     }))
     build.onLoad({ filter: /[/\\]internal[/\\]httpApi(?:Scalar|Swagger)\.js$/ }, () => ({
       contents:
