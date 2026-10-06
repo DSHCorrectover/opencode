@@ -410,6 +410,20 @@ export const ShellTool = Tool.define(
         }
       }
 
+      // A bare redirect (e.g. `> file`, `>> file`, `2> file`) is a valid
+      // command that truncates or creates the target, but it parses to zero
+      // `command` nodes. Without a pattern it would skip the permission
+      // evaluation entirely and run unchecked, so evaluate the raw
+      // redirected statement instead.
+      for (const node of root
+        .descendantsOfType("redirected_statement")
+        .filter((child): child is Node => Boolean(child))) {
+        if (commands(node).length > 0) continue
+        const statement = node.text.trim()
+        if (!statement) continue
+        scan.patterns.add(statement)
+      }
+
       return scan
     })
 

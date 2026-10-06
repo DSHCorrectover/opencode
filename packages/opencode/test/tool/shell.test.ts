@@ -11,6 +11,7 @@ import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
+import * as PermissionModule from "../../src/permission"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -170,6 +171,23 @@ const capture = (requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" |
     }),
 })
 
+// Mirrors the production Permission service: evaluate every requested
+// pattern against the configured ruleset, failing closed on an explicit
+// deny rule (e.g. permission.bash "*": "deny").
+const enforce = (ruleset: PermissionV1.Ruleset) =>
+  ({
+    ...ctx,
+    ask: (req: Omit<PermissionV1.AskInput, "id" | "sessionID" | "tool">) =>
+      Effect.gen(function* () {
+        for (const pattern of req.patterns) {
+          const rule = PermissionModule.evaluate(req.permission, pattern, req.ruleset ?? ruleset)
+          if (rule.action === "deny") {
+            return yield* new PermissionV1.DeniedError({ ruleset })
+          }
+        }
+      }),
+  }) as typeof ctx
+
 const mustTruncate = (result: {
   metadata: { truncated?: boolean; exit?: number | null } & Record<string, unknown>
   output: string
@@ -258,6 +276,71 @@ describe("tool.shell permissions", () => {
           expect(requests[0].permission).toBe("bash")
           expect(requests[0].patterns).toContain("echo foo")
           expect(requests[0].patterns).toContain("echo bar")
+        }),
+      )
+    }),
+  )
+
+  each("denies a bare redirect under a wildcard deny rule", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          yield* Effect.promise(() => Bun.write(path.join(tmp, "victim.txt"), "important data"))
+          const ruleset = [{ permission: "bash", pattern: "*", action: "deny" as const }]
+          const error = yield* fail(
+            {
+              command: "> victim.txt",
+            },
+            enforce(ruleset),
+          )
+          expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+          const content = yield* Effect.promise(() => Bun.file(path.join(tmp, "victim.txt")).text())
+          expect(content).toBe("important data")
+        }),
+      )
+    }),
+  )
+
+  each("asks permission for a bare redirect using the raw statement", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run(
+            {
+              command: ">> victim.txt",
+            },
+            capture(requests),
+          )
+          expect(requests.length).toBe(1)
+          expect(requests[0].permission).toBe("bash")
+          expect(requests[0].patterns).toContain(">> victim.txt")
+        }),
+      )
+    }),
+  )
+
+  each("does not regress permission prompts for a redirect with a command", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run(
+            {
+              command: "echo hi > out.txt",
+            },
+            capture(requests),
+          )
+          expect(requests.length).toBe(1)
+          expect(requests[0].permission).toBe("bash")
+          expect(requests[0].patterns).toContain("echo hi > out.txt")
+          expect(requests[0].patterns).not.toContain("> out.txt")
         }),
       )
     }),
