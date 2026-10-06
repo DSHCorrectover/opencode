@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import path from "node:path"
 import type { McpServer } from "@agentclientprotocol/sdk"
 import { Schema } from "effect"
 import { currentValue } from "./select-options"
@@ -80,11 +79,10 @@ describe("acp session lifecycle over the wire", () => {
     expect(
       await rpcError(acp.request("session/load", { cwd: "/elsewhere", sessionId: "ses_loaded", mcpServers: [] })),
     ).toMatchObject({ code: -32602, data: { sessionId: "ses_loaded", cwd: "/elsewhere" } })
-    const elsewhere = path.resolve("/elsewhere")
     const sessions = new Set(acp.server.sessions.keys())
     expect(
-      await rpcError(acp.request("session/fork", { cwd: elsewhere, sessionId: "ses_loaded", mcpServers: [] })),
-    ).toMatchObject({ code: -32602, data: { sessionId: "ses_loaded", cwd: elsewhere } })
+      await rpcError(acp.request("session/fork", { cwd: "/elsewhere", sessionId: "ses_loaded", mcpServers: [] })),
+    ).toMatchObject({ code: -32602, data: { sessionId: "ses_loaded", cwd: "/elsewhere" } })
     expect(new Set(acp.server.sessions.keys())).toEqual(sessions)
     expect(
       await rpcError(acp.request("session/load", { cwd: "/workspace", sessionId: "ses_missing", mcpServers: [] })),
