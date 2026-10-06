@@ -169,26 +169,33 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
   )
   await Bun.write(
     new URL("node_modules/effect-helper/index.js", sources.url),
-    'import { Effect, Schema } from "effect"; import { some } from "effect/Option"; export const helper = { Effect, Schema, some }',
+    [
+      'import { Effect, Schema }',
+      'from "effect"; import { some }',
+      'from "effect/Option"; export const helper = { Effect, Schema, some }',
+    ].join(" "),
   )
   await Bun.write(
     new URL("node_modules/zod/package.json", sources.url),
     '{"name":"zod","type":"module","exports":{".":"./index.js"}}',
   )
   await Bun.write(new URL("node_modules/zod/index.js", sources.url), "export const fromPluginZod = true")
-  await Bun.write(new URL("helper.ts", sources.url), 'import { fromPluginZod } from "zod"; export { fromPluginZod }')
+  await Bun.write(
+    new URL("helper.ts", sources.url),
+    ['import { fromPluginZod }', 'from "zod"; export { fromPluginZod }'].join(" "),
+  )
   await Bun.write(
     entry,
-    `import { createSignal } from "solid-js"
-    import { Plugin } from "@opencode/plugin/tui"
-    import { Plugin as HostEffectPlugin } from "@opencode/plugin/effect"
-    import { Effect, Schema } from "effect"
-    import { some } from "effect/Option"
-    import pkg from "effect/package.json" with { type: "json" }
-    import { helper } from "effect-helper"
-    const { fromPluginZod } = await import("./helper.ts")
-    export const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, pkgName: pkg.name, fromPluginZod }
-    export { helper }`,
+    [
+      'import { createSignal }',
+      'from "solid-js"\nimport { Plugin }',
+      'from "@opencode/plugin/tui"\nimport { Plugin as HostEffectPlugin }',
+      'from "@opencode/plugin/effect"\nimport { Effect, Schema }',
+      'from "effect"\nimport { some }',
+      'from "effect/Option"\nimport pkg',
+      'from "effect/package.json" with { type: "json" }\nimport { helper }',
+      'from "effect-helper"\nconst { fromPluginZod } = await import("./helper.ts")\nexport const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, pkgName: pkg.name, fromPluginZod }\nexport { helper }',
+    ].join(" "),
   )
   const loaded = (await sources.read(entry.href)).module as {
     plugin: Record<string, unknown>
@@ -211,7 +218,11 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
   const badEntry = new URL("bad-tui.ts", sources.url)
   await Bun.write(
     badEntry,
-    'import { Plugin } from "@opencode/plugin/tui"; import { removed } from "effect/RemovedSubpath"; export default { Plugin, removed }',
+    [
+      'import { Plugin }',
+      'from "@opencode/plugin/tui"; import { removed }',
+      'from "effect/RemovedSubpath"; export default { Plugin, removed }',
+    ].join(" "),
   )
   await expect(sources.read(badEntry.href)).rejects.toThrow("effect/RemovedSubpath.js")
 })
@@ -229,28 +240,39 @@ test.each(["cli-first", "opentui-first"] as const)(
     const pluginEntry = path.join(dir.path, "tui.ts")
     await Bun.write(
       pluginEntry,
-      `import { Plugin } from "@opencode/plugin/tui"
-      import { createSignal } from "solid-js"
-      import { Effect } from "effect"
-      import { nominal } from "effect/Brand"
-      export const captured = { Plugin, createSignal, Effect, nominal }`,
+      [
+        'import { Plugin }',
+        'from "@opencode/plugin/tui"\nimport { createSignal }',
+        'from "solid-js"\nimport { Effect }',
+        'from "effect"\nimport { nominal }',
+        'from "effect/Brand"\nexport const captured = { Plugin, createSignal, Effect, nominal }',
+      ].join(" "),
     )
 
     const probe = path.join(dir.path, "probe.ts")
+    const cliRuntimeUrl = fileURLToPath(new URL("../../cli/src/plugin-runtime.ts", import.meta.url))
+    const openTuiConfigureUrl = Bun.resolveSync("@opentui/solid/runtime-plugin-support/configure", import.meta.dir)
+    const pluginTuiUrl = Bun.resolveSync("@opencode/plugin/tui", import.meta.dir)
+    const tuiSourceUrl = fileURLToPath(new URL("../src/plugin/source.ts", import.meta.url))
+    const solidUrl = Bun.resolveSync("solid-js", import.meta.dir)
     await Bun.write(
       probe,
       `import assert from "node:assert/strict"
       import { createRequire } from "node:module"
+      const { ensurePluginRuntime } = await import(${JSON.stringify(cliRuntimeUrl)})
+      const { ensureRuntimePluginSupport } = await import(${JSON.stringify(openTuiConfigureUrl)})
+      const { Plugin, PluginContextProvider, usePlugin } = await import(${JSON.stringify(pluginTuiUrl)})
       if (${JSON.stringify(order)} === "cli-first") {
-        const { ensurePluginRuntime } = await import(${JSON.stringify(fileURLToPath(new URL("../../cli/src/plugin-runtime.ts", import.meta.url)))})
+        ensurePluginRuntime()
+        ensureRuntimePluginSupport({ additional: { "@opencode/plugin/tui": { Plugin, PluginContextProvider, usePlugin } } })
+      } else {
+        ensureRuntimePluginSupport({ additional: { "@opencode/plugin/tui": { Plugin, PluginContextProvider, usePlugin } } })
         ensurePluginRuntime()
       }
-      await import(${JSON.stringify(fileURLToPath(new URL("../src/plugin/runtime-plugin-support.bun.ts", import.meta.url)))})
-      const { createPluginSources } = await import(${JSON.stringify(fileURLToPath(new URL("../src/plugin/source.ts", import.meta.url)))})
-      const { Effect, Brand, Option, Schema } = await import("effect")
-      const { Plugin } = await import("@opencode/plugin/tui")
-      const { Plugin: EffectPlugin } = await import("@opencode/plugin/effect")
-      const { createSignal } = await import(${JSON.stringify(Bun.resolveSync("solid-js", import.meta.dir))})
+      const { createPluginSources } = await import(${JSON.stringify(tuiSourceUrl)})
+      const { Effect, Brand, Option, Schema } = await import(${JSON.stringify("effect")})
+      const { Plugin: EffectPlugin } = await import(${JSON.stringify("@opencode/plugin/effect")})
+      const { createSignal } = await import(${JSON.stringify(solidUrl)})
       const req = createRequire(import.meta.url)
       assert.equal(req("effect/Option").some, Option.some)
       assert.equal(req("@opencode/plugin/effect").Plugin, EffectPlugin)

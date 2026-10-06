@@ -71,12 +71,21 @@ export function ensurePluginRuntime(): Readonly<Record<string, RuntimeModuleLoad
   if (typeof Bun === "undefined") return {}
   const state = globalThis as GlobalState
   if (state[runtimeModulesKey]) return state[runtimeModulesKey]
+  const specifierByRealPath = new Map<string, string>()
   const modules =
     prebundledModules ??
     (() => {
       const entries = discoverPluginRuntimeSpecifiers()
-      const effectEntry = entries.get("effect")
-      if (effectEntry) require(effectEntry)
+      for (const [specifier, resolved] of entries) {
+        const real = realpathSync(resolved)
+        if (!specifierByRealPath.has(real) || specifier.length < specifierByRealPath.get(real)!.length) {
+          specifierByRealPath.set(real, specifier)
+        }
+      }
+      for (const entry of ["effect", "@opencode/plugin", "@opencode/plugin/effect", "@opencode/plugin/rpc", "@opencode/plugin/host"]) {
+        const resolved = entries.get(entry)
+        if (resolved) require(resolved)
+      }
       return Object.fromEntries(
         [...entries.entries()].map(([specifier, resolved]) => [specifier, createLoader(resolved)]),
       )
@@ -96,9 +105,9 @@ export function ensurePluginRuntime(): Readonly<Record<string, RuntimeModuleLoad
         })
       }
       build.onResolve(
-        { filter: /^file:\/\/.*[/\\]node_modules[/\\](?:effect|@opencode[/\\]plugin)[/\\]/ },
+        { filter: /^file:\/\// },
         (args) => {
-          const matched = resolveRewrittenHostSpecifier(args.path, modules)
+          const matched = resolveRewrittenHostSpecifier(args.path, modules, specifierByRealPath)
           return matched ? { path: matched } : undefined
         },
       )
@@ -168,13 +177,21 @@ function findNodeModulesDir(pkgName: string, from: string, realDir: string) {
   }
 }
 
-function resolveRewrittenHostSpecifier(fileUrl: string, modules: Readonly<Record<string, unknown>>) {
+function resolveRewrittenHostSpecifier(
+  fileUrl: string,
+  modules: Readonly<Record<string, unknown>>,
+  specifierByRealPath: ReadonlyMap<string, string>,
+) {
   let targetPath: string
   try {
     targetPath = fileURLToPath(fileUrl)
   } catch {
     return undefined
   }
+  try {
+    const direct = specifierByRealPath.get(realpathSync(targetPath))
+    if (direct) return direct
+  } catch {}
   const match = targetPath.match(/^(.*)[/\\]node_modules[/\\](@opencode[/\\]plugin|effect)[/\\](.+)$/)
   if (!match) return undefined
   const [, ownerDir, rawPkg, rawSubpath] = match
