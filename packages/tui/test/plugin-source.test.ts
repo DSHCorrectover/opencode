@@ -177,58 +177,47 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
     watched.push(file)
   })
   const entry = new URL("tui.ts", sources.url)
+  const badEntry = new URL("bad-tui.ts", sources.url)
   const absExtra = new URL("abs-extra.ts", sources.url)
-  await Bun.write(
-    new URL("node_modules/effect/package.json", sources.url),
-    '{"name":"effect","version":"3.19.19","type":"module","exports":{".":{"import":"./dist/esm/index.js"},"./Option":{"import":"./dist/esm/Option.js"},"./RemovedSubpath":{"import":"./dist/esm/RemovedSubpath.js"},"./package.json":"./package.json"}}',
-  )
-  await Bun.write(
-    new URL("node_modules/effect/dist/esm/index.js", sources.url),
-    "export const Effect = { foreign: true }; export const Schema = { foreign: true }",
-  )
-  await Bun.write(new URL("node_modules/effect/dist/esm/Option.js", sources.url), "export const some = () => null")
-  await Bun.write(
-    new URL("node_modules/effect/dist/esm/RemovedSubpath.js", sources.url),
-    "export const removed = true",
-  )
-  await Bun.write(
-    new URL("node_modules/effect-helper/package.json", sources.url),
-    '{"name":"effect-helper","type":"module","exports":{".":"./index.js"}}',
-  )
-  await Bun.write(
-    new URL("node_modules/effect-helper/index.js", sources.url),
-    [
-      'import { Effect, Schema }',
-      'from "effect"; import { some }',
-      'from "effect/Option"; export const helper = { Effect, Schema, some }',
-    ].join(" "),
-  )
-  await Bun.write(
-    new URL("node_modules/zod/package.json", sources.url),
-    '{"name":"zod","type":"module","exports":{".":"./index.js"}}',
-  )
-  await Bun.write(new URL("node_modules/zod/index.js", sources.url), "export const fromPluginZod = true")
-  await Bun.write(
-    new URL("helper.ts", sources.url),
-    ['import { fromPluginZod }', 'from "zod"; export { fromPluginZod }'].join(" "),
-  )
-  await Bun.write(absExtra, 'export const absValue = "own-abs-file"')
-  await Bun.write(
-    entry,
-    [
-      'import { createSignal }',
-      'from "solid-js"\nimport { Plugin }',
-      'from "@opencode/plugin/tui"\nimport { Plugin as HostEffectPlugin }',
-      'from "@opencode/plugin/effect"\nimport { Effect, Schema }',
-      'from "effect"\nimport { some }',
-      'from "effect/Option"\nimport pkg',
-      'from "effect/package.json" with { type: "json" }\nimport { helper }',
-      'from "effect-helper"\nconst { fromPluginZod } = await import("./helper.ts")',
-      '\nconst dynOption = await import("effect/Option")',
-      '\nconst dynEffectPlugin = await import("@opencode/plugin/effect")',
-      `\nconst { absValue } = await import(${JSON.stringify(fileURLToPath(absExtra))})`,
-      "\nexport const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, dynSome: dynOption.some, dynEffectPlugin: dynEffectPlugin.Plugin, absValue, pkgName: pkg.name, fromPluginZod }\nexport { helper }",
-    ].join(" "),
+  await Promise.all(
+    Object.entries({
+      "node_modules/effect/package.json":
+        '{"name":"effect","version":"3.19.19","type":"module","exports":{".":{"import":"./dist/esm/index.js"},"./Option":{"import":"./dist/esm/Option.js"},"./RemovedSubpath":{"import":"./dist/esm/RemovedSubpath.js"},"./package.json":"./package.json"}}',
+      "node_modules/effect/dist/esm/index.js":
+        "export const Effect = { foreign: true }; export const Schema = { foreign: true }",
+      "node_modules/effect/dist/esm/Option.js": "export const some = () => null",
+      "node_modules/effect/dist/esm/RemovedSubpath.js": "export const removed = true",
+      "node_modules/effect-helper/package.json":
+        '{"name":"effect-helper","type":"module","exports":{".":"./index.js"}}',
+      "node_modules/effect-helper/index.js": [
+        'import { Effect, Schema }',
+        'from "effect"; import { some }',
+        'from "effect/Option"; export const helper = { Effect, Schema, some }',
+      ].join(" "),
+      "node_modules/zod/package.json": '{"name":"zod","type":"module","exports":{".":"./index.js"}}',
+      "node_modules/zod/index.js": "export const fromPluginZod = true",
+      "helper.ts": ['import { fromPluginZod }', 'from "zod"; export { fromPluginZod }'].join(" "),
+      "abs-extra.ts": 'export const absValue = "own-abs-file"',
+      "tui.ts": [
+        'import { createSignal }',
+        'from "solid-js"\nimport { Plugin }',
+        'from "@opencode/plugin/tui"\nimport { Plugin as HostEffectPlugin }',
+        'from "@opencode/plugin/effect"\nimport { Effect, Schema }',
+        'from "effect"\nimport { some }',
+        'from "effect/Option"\nimport pkg',
+        'from "effect/package.json" with { type: "json" }\nimport { helper }',
+        'from "effect-helper"\nconst { fromPluginZod } = await',
+        'import("./helper.ts")\nconst dynOption = await',
+        'import("effect/Option")\nconst dynEffectPlugin = await',
+        `import("@opencode/plugin/effect")\nconst { absValue } = await import(${JSON.stringify(fileURLToPath(absExtra))})`,
+        "\nexport const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, dynSome: dynOption.some, dynEffectPlugin: dynEffectPlugin.Plugin, absValue, pkgName: pkg.name, fromPluginZod }\nexport { helper }",
+      ].join(" "),
+      "bad-tui.ts": [
+        'import { Plugin }',
+        'from "@opencode/plugin/tui"; import { removed }',
+        'from "effect/RemovedSubpath"; export default { Plugin, removed }',
+      ].join(" "),
+    }).map(([file, text]) => Bun.write(new URL(file, sources.url), text)),
   )
   const loaded = (await sources.read(entry.href)).module as {
     plugin: Record<string, unknown>
@@ -250,16 +239,6 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
   expect(loaded.helper.some).toBe(Option.some)
   expect(watched.some((item) => item.replaceAll("\\", "/").endsWith("/node_modules/effect"))).toBe(false)
   expect(watched.some((item) => item.replaceAll("\\", "/").endsWith("/node_modules/@opencode/plugin"))).toBe(false)
-
-  const badEntry = new URL("bad-tui.ts", sources.url)
-  await Bun.write(
-    badEntry,
-    [
-      'import { Plugin }',
-      'from "@opencode/plugin/tui"; import { removed }',
-      'from "effect/RemovedSubpath"; export default { Plugin, removed }',
-    ].join(" "),
-  )
   await expect(sources.read(badEntry.href)).rejects.toThrow("effect/dist/esm/RemovedSubpath.js")
 })
 

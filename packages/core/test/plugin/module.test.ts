@@ -267,18 +267,31 @@ export default Plugin.define({
   }),
 )
 
-it.live("fails loudly at load when a plugin imports an unprovided effect/* subpath from its own node_modules, while allowing effect/package.json", () =>
+it.live("redirects plugin dependencies with a nested Effect 3 installation to the host, allows effect/package.json, and fails loudly on unprovided subpaths", () =>
   Effect.gen(function* () {
     const directory = yield* tmpdirScoped()
-    const okDir = path.join(directory.path, "pkg-json-plugin")
+    const pluginDir = path.join(directory.path, "v3-dep-plugin")
     const badDir = path.join(directory.path, "removed-subpath-plugin")
+    const v3DepDir = path.join(pluginDir, "node_modules/v3-dep")
 
     yield* Effect.promise(() =>
       writeFiles(directory.path, {
-        "pkg-json-plugin/node_modules/effect/package.json":
+        "v3-dep-plugin/node_modules/effect/package.json":
           '{"name":"effect","version":"4.0.0-rc.111","type":"module","exports":{"./package.json":"./package.json"}}',
-        "pkg-json-plugin/index.ts":
-          'import pkg from "effect/package.json" with { type: "json" }; export const effectPkgName = pkg.name; export default { id: "pkg-json-plugin", async setup() {} }',
+        "v3-dep-plugin/node_modules/v3-dep/node_modules/effect/package.json":
+          '{"name":"effect","version":"3.19.19","type":"module","exports":{".":"./index.js","./Option":"./Option.js","./ReadonlyArray":"./ReadonlyArray.js"}}',
+        "v3-dep-plugin/node_modules/v3-dep/node_modules/effect/index.js":
+          "export const Effect = { major: 3 }; export const Schema = { major: 3 }",
+        "v3-dep-plugin/node_modules/v3-dep/node_modules/effect/Option.js": "export const some = () => ({ major: 3 })",
+        "v3-dep-plugin/node_modules/v3-dep/node_modules/effect/ReadonlyArray.js": "export const fromIterable = () => []",
+        "v3-dep-plugin/node_modules/v3-dep/package.json":
+          '{"name":"v3-dep","type":"module","exports":{".":"./index.js","./v3-only":"./v3-only.js"}}',
+        "v3-dep-plugin/node_modules/v3-dep/index.js":
+          'import { Effect, Schema } from "effect"; import { some } from "effect/Option"; export const v3DepCaptured = { Effect, Schema, some }',
+        "v3-dep-plugin/node_modules/v3-dep/v3-only.js":
+          'import { fromIterable } from "effect/ReadonlyArray"; export { fromIterable }',
+        "v3-dep-plugin/index.ts":
+          'import pkg from "effect/package.json" with { type: "json" }; import { v3DepCaptured } from "v3-dep"; export const effectPkgName = pkg.name; export { v3DepCaptured }; export default { id: "v3-dep-plugin", async setup() {} }',
         "removed-subpath-plugin/node_modules/effect/package.json":
           '{"name":"effect","type":"module","exports":{"./RemovedLegacySubpath":"./RemovedLegacySubpath.js"}}',
         "removed-subpath-plugin/node_modules/effect/RemovedLegacySubpath.js": "export const legacy = true",
@@ -288,51 +301,22 @@ it.live("fails loudly at load when a plugin imports an unprovided effect/* subpa
     )
 
     const modules = yield* PluginModule.make()
-    expect(yield* modules.load({ type: "add", target: okDir, options: {} })).toMatchObject({ id: "pkg-json-plugin" })
-
-    const exit = yield* modules.load({ type: "add", target: badDir, options: {} }).pipe(Effect.exit)
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (Exit.isFailure(exit)) {
-      expect(String(Cause.squash(exit.cause))).toContain("effect/RemovedLegacySubpath.js")
-    }
-  }),
-)
-
-it.live("redirects plugin dependencies with a nested Effect 3 installation to the host's Effect instance", () =>
-  Effect.gen(function* () {
-    const directory = yield* tmpdirScoped()
-    const pluginDir = path.join(directory.path, "v3-dep-plugin")
-    const v3DepDir = path.join(pluginDir, "node_modules/v3-dep")
-
-    yield* Effect.promise(() =>
-      writeFiles(pluginDir, {
-        "node_modules/v3-dep/node_modules/effect/package.json":
-          '{"name":"effect","version":"3.19.19","type":"module","exports":{".":"./index.js","./Option":"./Option.js","./ReadonlyArray":"./ReadonlyArray.js"}}',
-        "node_modules/v3-dep/node_modules/effect/index.js":
-          "export const Effect = { major: 3 }; export const Schema = { major: 3 }",
-        "node_modules/v3-dep/node_modules/effect/Option.js": "export const some = () => ({ major: 3 })",
-        "node_modules/v3-dep/node_modules/effect/ReadonlyArray.js": "export const fromIterable = () => []",
-        "node_modules/v3-dep/package.json":
-          '{"name":"v3-dep","type":"module","exports":{".":"./index.js","./v3-only":"./v3-only.js"}}',
-        "node_modules/v3-dep/index.js":
-          'import { Effect, Schema } from "effect"; import { some } from "effect/Option"; export const v3DepCaptured = { Effect, Schema, some }',
-        "node_modules/v3-dep/v3-only.js":
-          'import { fromIterable } from "effect/ReadonlyArray"; export { fromIterable }',
-        "index.ts":
-          'import { v3DepCaptured } from "v3-dep"; export { v3DepCaptured }; export default { id: "v3-dep-plugin", async setup() {} }',
-      }),
-    )
-
-    const modules = yield* PluginModule.make()
     expect(yield* modules.load({ type: "add", target: pluginDir, options: {} })).toMatchObject({ id: "v3-dep-plugin" })
 
     const imported = yield* Effect.promise(() => import(path.join(pluginDir, "index.ts")))
+    expect(imported.effectPkgName).toBe("effect")
     expect(imported.v3DepCaptured.Effect).toBe(Effect)
     expect(imported.v3DepCaptured.Schema).toBe(Schema)
     expect(imported.v3DepCaptured.some).toBe(Option.some)
     yield* Effect.promise(async () => {
       await expect(import(path.join(v3DepDir, "v3-only.js"))).rejects.toThrow("effect/ReadonlyArray.js")
     })
+
+    const exit = yield* modules.load({ type: "add", target: badDir, options: {} }).pipe(Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      expect(String(Cause.squash(exit.cause))).toContain("effect/RemovedLegacySubpath.js")
+    }
   }),
 )
 

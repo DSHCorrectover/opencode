@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 type RuntimeModuleLoader = () => Record<string, unknown> | Promise<Record<string, unknown>>
 
 const runtimeModulesKey = Symbol.for("opencode.plugin.runtime-modules")
+const runtimePackages = ["effect", "@opencode/plugin"] as const
+const nodeModulesPkgPattern = /^(.*)[/\\]node_modules[/\\](@opencode[/\\]plugin|effect)[/\\](.+)$/
 const prebundledModules: Readonly<Record<string, RuntimeModuleLoader>> | undefined = undefined
 
 type GlobalState = typeof globalThis & {
@@ -13,7 +15,7 @@ type GlobalState = typeof globalThis & {
 
 export function discoverPluginRuntimeSpecifiers(
   from = import.meta.dir,
-  packages: readonly string[] = ["effect", "@opencode/plugin"],
+  packages: readonly string[] = runtimePackages,
 ): ReadonlyMap<string, string> {
   const entries = new Map<string, string>()
   for (const pkgName of packages) {
@@ -31,12 +33,8 @@ export function discoverPluginRuntimeSpecifiers(
       if (normalized.startsWith("internal/") || normalized.includes("/internal/") || normalized.startsWith("source.")) {
         continue
       }
-      const base = normalized.slice(0, -ext.length)
-      if (base === "index") continue
-      const candidates = base.endsWith("/index")
-        ? [`${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`]
-        : [`${pkgName}/${base}`]
-      for (const specifier of candidates) {
+      for (const specifier of specifierCandidates(pkgName, normalized)) {
+        if (entries.has(specifier)) continue
         try {
           entries.set(specifier, toLoadPath(Bun.resolveSync(specifier, from)))
         } catch {}
@@ -80,7 +78,6 @@ export function ensurePluginRuntime() {
       )
     })()
   state[runtimeModulesKey] = modules
-  const foreignFilter = createForeignPackageFilter()
   const hostPluginDir = prebundledModules
     ? undefined
     : path.dirname(Bun.resolveSync("@opencode/plugin/package.json", import.meta.dir))
@@ -90,10 +87,9 @@ export function ensurePluginRuntime() {
       for (const [specifier, load] of Object.entries(modules)) {
         build.module(specifier, () => {
           const exports = load()
-          if (exports instanceof Promise) {
-            return exports.then((value) => ({ exports: value, loader: "object" as const }))
-          }
-          return { exports, loader: "object" }
+          return exports instanceof Promise
+            ? exports.then((value) => ({ exports: value, loader: "object" as const }))
+            : { exports, loader: "object" as const }
         })
       }
       // Temporary until OpenTUI preserves host specifiers (anomalyco/opentui#1569).
@@ -102,9 +98,9 @@ export function ensurePluginRuntime() {
         const matched = resolveRewrittenHostSpecifier(args.path, modules, hostPluginDir)
         return matched ? { path: matched } : undefined
       })
-      build.onLoad({ filter: foreignFilter }, (args) => {
-        const match = args.path.replaceAll("\\", "/").match(/\/node_modules\/((?:@opencode\/plugin|effect)\/.+)$/)
-        const target = match ? match[1] : args.path
+      build.onLoad({ filter: createForeignPackageFilter() }, (args) => {
+        const match = args.path.match(nodeModulesPkgPattern)
+        const target = match ? `${match[2]}/${match[3]}`.replaceAll("\\", "/") : args.path
         throw new Error(
           `Cannot load "${target}" from plugin node_modules: "${target}" is not provided by OpenCode; plugins must use the host's "effect" and "@opencode/plugin" modules.`,
         )
@@ -137,14 +133,13 @@ export function createLoader(resolved: string): RuntimeModuleLoader {
 export function createForeignPackageFilter(rootsInput?: Iterable<string>) {
   const suffix = String.raw`[/\\]node_modules[/\\](?:effect|@opencode[/\\]plugin)[/\\].*\.[cm]?[jt]sx?(?:[?#].*)?$`
   if (prebundledModules && !rootsInput) return new RegExp(suffix)
-  const roots = new Set<string>(rootsInput)
-  if (!rootsInput) {
-    for (const pkgName of ["effect", "@opencode/plugin"]) {
-      const dir = path.dirname(Bun.resolveSync(`${pkgName}/package.json`, import.meta.dir))
-      roots.add(dir)
-      roots.add(findNodeModulesDir(pkgName, import.meta.dir, dir))
-    }
-  }
+  const roots = new Set<string>(
+    rootsInput ??
+      runtimePackages.flatMap((pkgName) => {
+        const dir = path.dirname(Bun.resolveSync(`${pkgName}/package.json`, import.meta.dir))
+        return [dir, findNodeModulesDir(pkgName, import.meta.dir, dir)]
+      }),
+  )
   const escaped = [...roots]
     .map((value) =>
       value
@@ -164,28 +159,30 @@ function findNodeModulesDir(pkgName: string, from: string, realDir: string) {
   }
 }
 
+function specifierCandidates(pkgName: string, subpath: string) {
+  const base = subpath
+    .replaceAll("\\", "/")
+    .replace(/^(?:dist(?:\/(?:esm|cjs))?|src)\//, "")
+    .replace(/\.[cm]?[jt]sx?(?:[?#].*)?$/, "")
+  if (base === "index") return [pkgName]
+  return base.endsWith("/index")
+    ? [`${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`, pkgName]
+    : [`${pkgName}/${base}`, pkgName]
+}
+
 function resolveRewrittenHostSpecifier(
   specifier: string,
   modules: Readonly<Record<string, unknown>>,
   hostPluginDir?: string,
 ) {
   const targetPath = specifier.startsWith("file://") ? fileURLToPath(specifier) : specifier
-  const match = targetPath.match(/^(.*)[/\\]node_modules[/\\](@opencode[/\\]plugin|effect)[/\\](.+)$/)
+  const match = targetPath.match(nodeModulesPkgPattern)
   const rel = !match && hostPluginDir ? path.relative(hostPluginDir, targetPath) : undefined
-  if (!match && (!rel || rel.startsWith("..") || path.isAbsolute(rel))) return undefined
-  if (!existsSync(targetPath)) return undefined
+  if ((!match && (!rel || rel.startsWith("..") || path.isAbsolute(rel))) || !existsSync(targetPath)) return undefined
   const ownerDir = match ? match[1] || "/" : import.meta.dir
   const pkgName = match ? match[2].replaceAll("\\", "/") : "@opencode/plugin"
-  const rawSubpath = match ? match[3] : rel!
   const targetReal = realpathSync(targetPath)
-  const base = rawSubpath
-    .replaceAll("\\", "/")
-    .replace(/^(?:dist(?:\/(?:esm|cjs))?|src)\//, "")
-    .replace(/\.[cm]?[jt]sx?(?:[?#].*)?$/, "")
-  const candidates = base.endsWith("/index")
-    ? [pkgName, `${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`]
-    : [pkgName, `${pkgName}/${base}`]
-  return candidates.find((candidate) => {
+  return specifierCandidates(pkgName, match ? match[3] : rel!).find((candidate) => {
     if (!(candidate in modules)) return false
     try {
       return Bun.resolveSync(candidate, ownerDir) === targetReal
