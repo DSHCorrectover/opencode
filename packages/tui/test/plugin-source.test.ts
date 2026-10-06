@@ -4,7 +4,6 @@ import path from "node:path"
 import { mkdir, rename, symlink } from "node:fs/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { Host } from "@opencode/plugin/host"
-import { Plugin as EffectPlugin } from "@opencode/plugin/effect"
 import "../src/plugin/runtime-plugin-support.bun"
 import { createPluginSources } from "../src/plugin/source"
 import { createSourceWatcher } from "../src/plugin/watch"
@@ -142,27 +141,56 @@ test("shared runtime and ordinary package identities survive plugin generations"
 })
 
 test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect resolve effect and effect/* to the host copy without rewriting host Effect or hijacking plugin dependencies", async () => {
+  const effectPlugin = await import("@opencode/plugin/effect")
   const req = createRequire(import.meta.url)
   expect(req("effect").Effect).toBe(Effect)
   expect(req("effect/Option").some).toBe(Option.some)
-  expect(req("@opencode/plugin/effect").Plugin).toBe(EffectPlugin)
+  expect(req("@opencode/plugin/effect").Plugin).toBe(effectPlugin.Plugin)
   expect(JSON.stringify(Schema.Option(Schema.String).ast)).not.toContain("opentui:runtime-module:")
+
+  const standalone = Bun.spawnSync(
+    [
+      process.execPath,
+      "-e",
+      [
+        `import ${JSON.stringify(fileURLToPath(new URL("../src/plugin/runtime-plugin-support.bun.ts", import.meta.url)))}`,
+        'import assert from "node:assert/strict"',
+        'import { createRequire } from "node:module"',
+        "const req = createRequire(import.meta.url)",
+        'const eff = req("effect")',
+        'const opt = req("effect/Option")',
+        'const plug = req("@opencode/plugin/effect")',
+        'const { Effect } = await import("effect")',
+        'const { some } = await import("effect/Option")',
+        'const { Plugin } = await import("@opencode/plugin/effect")',
+        "assert.equal(eff.Effect, Effect)",
+        "assert.equal(opt.some, some)",
+        "assert.equal(plug.Plugin, Plugin)",
+      ].join("\n"),
+    ],
+    { cwd: fileURLToPath(new URL("..", import.meta.url)), stdout: "pipe", stderr: "pipe" },
+  )
+  expect({ stderr: standalone.stderr.toString(), exit: standalone.exitCode }).toEqual({ stderr: "", exit: 0 })
 
   const watched: string[] = []
   await using sources = await fixture(async (file) => {
     watched.push(file)
   })
   const entry = new URL("tui.ts", sources.url)
+  const absExtra = new URL("abs-extra.ts", sources.url)
   await Bun.write(
     new URL("node_modules/effect/package.json", sources.url),
-    '{"name":"effect","version":"4.0.0-rc.111","type":"module","exports":{".":"./index.js","./Option":"./Option.js","./RemovedSubpath":"./RemovedSubpath.js","./package.json":"./package.json"}}',
+    '{"name":"effect","version":"3.19.19","type":"module","exports":{".":{"import":"./dist/esm/index.js"},"./Option":{"import":"./dist/esm/Option.js"},"./RemovedSubpath":{"import":"./dist/esm/RemovedSubpath.js"},"./package.json":"./package.json"}}',
   )
   await Bun.write(
-    new URL("node_modules/effect/index.js", sources.url),
+    new URL("node_modules/effect/dist/esm/index.js", sources.url),
     "export const Effect = { foreign: true }; export const Schema = { foreign: true }",
   )
-  await Bun.write(new URL("node_modules/effect/Option.js", sources.url), "export const some = () => null")
-  await Bun.write(new URL("node_modules/effect/RemovedSubpath.js", sources.url), "export const removed = true")
+  await Bun.write(new URL("node_modules/effect/dist/esm/Option.js", sources.url), "export const some = () => null")
+  await Bun.write(
+    new URL("node_modules/effect/dist/esm/RemovedSubpath.js", sources.url),
+    "export const removed = true",
+  )
   await Bun.write(
     new URL("node_modules/effect-helper/package.json", sources.url),
     '{"name":"effect-helper","type":"module","exports":{".":"./index.js"}}',
@@ -184,6 +212,7 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
     new URL("helper.ts", sources.url),
     ['import { fromPluginZod }', 'from "zod"; export { fromPluginZod }'].join(" "),
   )
+  await Bun.write(absExtra, 'export const absValue = "own-abs-file"')
   await Bun.write(
     entry,
     [
@@ -194,7 +223,11 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
       'from "effect"\nimport { some }',
       'from "effect/Option"\nimport pkg',
       'from "effect/package.json" with { type: "json" }\nimport { helper }',
-      'from "effect-helper"\nconst { fromPluginZod } = await import("./helper.ts")\nexport const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, pkgName: pkg.name, fromPluginZod }\nexport { helper }',
+      'from "effect-helper"\nconst { fromPluginZod } = await import("./helper.ts")',
+      '\nconst dynOption = await import("effect/Option")',
+      '\nconst dynEffectPlugin = await import("@opencode/plugin/effect")',
+      `\nconst { absValue } = await import(${JSON.stringify(fileURLToPath(absExtra))})`,
+      "\nexport const plugin = { createSignal, Plugin, HostEffectPlugin, Effect, Schema, some, dynSome: dynOption.some, dynEffectPlugin: dynEffectPlugin.Plugin, absValue, pkgName: pkg.name, fromPluginZod }\nexport { helper }",
     ].join(" "),
   )
   const loaded = (await sources.read(entry.href)).module as {
@@ -203,10 +236,13 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
   }
   expect(loaded.plugin.createSignal).toBe(createSignal)
   expect(loaded.plugin.Plugin).toBe(Plugin)
-  expect(loaded.plugin.HostEffectPlugin).toBe(EffectPlugin)
+  expect(loaded.plugin.HostEffectPlugin).toBe(effectPlugin.Plugin)
   expect(loaded.plugin.Effect).toBe(Effect)
   expect(loaded.plugin.Schema).toBe(Schema)
   expect(loaded.plugin.some).toBe(Option.some)
+  expect(loaded.plugin.dynSome).toBe(Option.some)
+  expect(loaded.plugin.dynEffectPlugin).toBe(effectPlugin.Plugin)
+  expect(loaded.plugin.absValue).toBe("own-abs-file")
   expect(loaded.plugin.pkgName).toBe("effect")
   expect(loaded.plugin.fromPluginZod).toBe(true)
   expect(loaded.helper.Effect).toBe(Effect)
@@ -224,7 +260,7 @@ test("TUI plugins importing @opencode/plugin/tui and solid-js alongside effect r
       'from "effect/RemovedSubpath"; export default { Plugin, removed }',
     ].join(" "),
   )
-  await expect(sources.read(badEntry.href)).rejects.toThrow("effect/RemovedSubpath.js")
+  await expect(sources.read(badEntry.href)).rejects.toThrow("effect/dist/esm/RemovedSubpath.js")
 })
 
 test("helper import.meta stays anchored to its source, including assets and resolution", async () => {

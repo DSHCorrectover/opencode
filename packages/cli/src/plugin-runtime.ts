@@ -71,12 +71,14 @@ export function ensurePluginRuntime() {
   if (state[runtimeModulesKey]) return state[runtimeModulesKey]
   const modules =
     prebundledModules ??
-    Object.fromEntries(
-      [...discoverPluginRuntimeSpecifiers().entries()].map(([specifier, resolved]) => [
-        specifier,
-        createLoader(resolved),
-      ]),
-    )
+    (() => {
+      const entries = discoverPluginRuntimeSpecifiers()
+      const effectEntry = entries.get("effect")
+      if (effectEntry) require(effectEntry)
+      return Object.fromEntries(
+        [...entries.entries()].map(([specifier, resolved]) => [specifier, createLoader(resolved)]),
+      )
+    })()
   state[runtimeModulesKey] = modules
   const foreignFilter = createForeignPackageFilter()
   const hostPluginDir = prebundledModules
@@ -95,7 +97,8 @@ export function ensurePluginRuntime() {
         })
       }
       // Temporary until OpenTUI preserves host specifiers (anomalyco/opentui#1569).
-      build.onResolve({ filter: /^file:\/\// }, (args) => {
+      build.onResolve({ filter: /^(?:file:\/\/|\/|[A-Za-z]:[/\\])/ }, (args) => {
+        if (!args.importer || args.importer === import.meta.path) return undefined
         const matched = resolveRewrittenHostSpecifier(args.path, modules, hostPluginDir)
         return matched ? { path: matched } : undefined
       })
@@ -162,11 +165,11 @@ function findNodeModulesDir(pkgName: string, from: string, realDir: string) {
 }
 
 function resolveRewrittenHostSpecifier(
-  fileUrl: string,
+  specifier: string,
   modules: Readonly<Record<string, unknown>>,
   hostPluginDir?: string,
 ) {
-  const targetPath = fileURLToPath(fileUrl)
+  const targetPath = specifier.startsWith("file://") ? fileURLToPath(specifier) : specifier
   const match = targetPath.match(/^(.*)[/\\]node_modules[/\\](@opencode[/\\]plugin|effect)[/\\](.+)$/)
   const rel = !match && hostPluginDir ? path.relative(hostPluginDir, targetPath) : undefined
   if (!match && (!rel || rel.startsWith("..") || path.isAbsolute(rel))) return undefined
@@ -177,7 +180,7 @@ function resolveRewrittenHostSpecifier(
   const targetReal = realpathSync(targetPath)
   const base = rawSubpath
     .replaceAll("\\", "/")
-    .replace(/^(?:dist|src)\//, "")
+    .replace(/^(?:dist(?:\/(?:esm|cjs))?|src)\//, "")
     .replace(/\.[cm]?[jt]sx?(?:[?#].*)?$/, "")
   const candidates = base.endsWith("/index")
     ? [pkgName, `${pkgName}/${base.slice(0, -"/index".length)}`, `${pkgName}/${base}`]
