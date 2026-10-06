@@ -28,10 +28,10 @@ export function configOptions(catalog: Catalog, selection: Selection): SessionCo
       name: "Model",
       category: "model",
       type: "select",
-      currentValue: `${model.providerID}/${model.id}`,
+      currentValue: advertisedModel(model),
       options: catalog.models
         .toSorted((a, b) => Order.String(a.providerID, b.providerID) || a.name.localeCompare(b.name))
-        .map((item) => ({ value: `${item.providerID}/${item.id}`, name: `${item.providerID}/${item.name}` })),
+        .map((item) => ({ value: advertisedModel(item), name: `${item.providerID}/${item.name}` })),
     },
     ...(variants.length > 0
       ? [
@@ -101,6 +101,8 @@ export const resolveChange = Effect.fnUntraced(function* (
 })
 
 export function parseModelSelection(value: string, models: ReadonlyArray<Model.Info>): Model.Ref {
+  const exact = models.find((model) => advertisedModel(model) === value)
+  if (exact) return { providerID: exact.providerID, id: exact.id }
   const providerID = models
     .map((model) => model.providerID)
     .toSorted()
@@ -136,6 +138,10 @@ const requireModel = Effect.fnUntraced(function* (catalog: Catalog, value: strin
       : undefined)
   return { providerID: model.providerID, id: model.id, variant } satisfies Model.Ref
 })
+
+function advertisedModel(model: { readonly providerID: string; readonly id: string }) {
+  return `${model.providerID}/${model.id}`
+}
 
 function selectVariant(variant: string | undefined, variants: readonly string[]) {
   if (!variant || variant === DEFAULT_VARIANT_VALUE) return DEFAULT_VARIANT_VALUE
